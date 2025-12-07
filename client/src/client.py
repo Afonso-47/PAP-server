@@ -4,40 +4,43 @@ from send_file_socket import (
     create_socket,
     send_unlock,
     send_mode,
+    send_path,
     receive_file,
     upload_file,
+    download_file,
     MODE_DOWNLOAD,
     MODE_UPLOAD,
 )
 
+
 def main():
-    if len(sys.argv) < 4:
-        print("Usage: python client.py <host> <port> <mode: download|upload> [path]")
-        print("  download: optional [output_dir], default '.'")
-        print("  upload:   required [file_to_send], optional target name")
+    if len(sys.argv) < 6:
+        print("Usage: python client.py <host> <port> <username> <download|upload> <path> [extra]")
+        print("  download: <remote_path> [output_dir]")
+        print("  upload:   <local_file> [remote_target_path]")
         sys.exit(1)
 
     host = sys.argv[1]
     port = int(sys.argv[2])
-    mode = sys.argv[3].lower()
+    username = sys.argv[3]
+    mode = sys.argv[4].lower()
 
     try:
         sock = create_socket(host, port)
         send_unlock(sock)
+        send_path(sock, username)
 
         if mode == "download":
-            output_dir = sys.argv[4] if len(sys.argv) >= 5 else "."
+            remote_path = sys.argv[5]
+            output_dir = sys.argv[6] if len(sys.argv) >= 7 else "."
             send_mode(sock, MODE_DOWNLOAD)
-            saved_path = receive_file(sock, output_dir)
+            saved_path = download_file(sock, remote_path, output_dir)
             print(f"File received and saved to {saved_path}")
         elif mode == "upload":
-            if len(sys.argv) < 5:
-                print("Upload mode requires a file path to send")
-                sys.exit(1)
-            filepath = sys.argv[4]
-            target_name = sys.argv[5] if len(sys.argv) >= 6 else None
+            local_file = sys.argv[5]
+            remote_target = sys.argv[6] if len(sys.argv) >= 7 else None
             send_mode(sock, MODE_UPLOAD)
-            upload_file(sock, filepath, target_name)
+            upload_file(sock, local_file, remote_target)
             print("File uploaded successfully")
         else:
             print("Mode must be 'download' or 'upload'")
@@ -48,6 +51,7 @@ def main():
     finally:
         sock.close()
         print("Transfer process finished.")
+
 
 if __name__ == "__main__":
     main()
