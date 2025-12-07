@@ -1,3 +1,9 @@
+# WARNING !!!
+
+There is a bug currently with the server-side where closing server_app via ctrl+C doesn't leave port 9001 available once again for running the server_app again.
+
+
+
 # PAP Server/Client Workflow
 
 This app uses a simple TCP protocol on port 9001 for secure bidirectional file transfer with user authentication and tilde path expansion.
