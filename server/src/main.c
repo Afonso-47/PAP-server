@@ -16,6 +16,12 @@ int main(void) {
 	server_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (server_fd < 0) { perror("socket"); exit(1); }
 
+	// Allow immediate port reuse after server restart
+	int opt = 1;
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+		perror("setsockopt SO_REUSEADDR"); exit(1);
+	}
+
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr.sin_port = htons(PORT);
