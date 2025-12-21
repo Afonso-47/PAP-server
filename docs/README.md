@@ -1,9 +1,3 @@
-# WARNING !!!
-
-There is a bug currently with the server-side where closing server_app via ctrl+C doesn't leave port 9001 available once again for running the server_app again.
-
-
-
 # PAP Server/Client Workflow
 
 This app uses a simple TCP protocol on port 9001 for secure bidirectional file transfer with user authentication and tilde path expansion.
@@ -24,17 +18,11 @@ This app uses a simple TCP protocol on port 9001 for secure bidirectional file t
 - If OK: server sends 4-byte BE filename length + basename + file data until EOF.
 - If ERROR: server closes connection (file not found or permission denied).
 
-### CLI Example
-```bash
-python client/src/client.py 10.0.0.1 9001 download ~/reports/data.csv ./downloads
-```
-This downloads `~/reports/data.csv` from the server (expanded to `/home/user/reports/data.csv` on server side) and saves it to `./downloads/data.csv` locally.
-
-### Interactive TUI
+### UI
 ```bash
 python client/src/main.py
 ```
-Provides an interactive menu for downloads and uploads with prompts for all parameters.
+Provides an interactive menu for downloads and uploads with prompts for all parameters. This is the single UI entry point.
 
 ## Uploading a file to the server
 - Client specifies local file and target path on server (supports tilde expansion).
@@ -43,17 +31,8 @@ Provides an interactive menu for downloads and uploads with prompts for all para
 - Server sends: 1-byte status (0x00=OK, 0x01=ERROR) before receiving file data.
 - If OK: server receives and saves file data; if ERROR: connection closes (mkdir failed, etc.).
 
-### CLI Examples
-```bash
-# Upload with tilde expansion (saves to user's home directory)
-python client/src/client.py 10.0.0.1 9001 upload ./report.txt ~/uploads/report.txt
-
-# Upload with absolute path (creates /tmp/uploads/ if needed)
-python client/src/client.py 10.0.0.1 9001 upload ./localfile.txt /tmp/uploads/file.txt
-
-# Upload with basename only (saves to server's current working directory)
-python client/src/client.py 10.0.0.1 9001 upload ./localfile.txt
-```
+### Upload via UI
+Use the menu in `client/src/main.py` to select Upload, provide local file and remote target path. Supports tilde expansion and auto-creating parent directories.
 
 ## Build & Run (server side)
 ```bash
@@ -77,22 +56,16 @@ unlock(0x01) → username_len(4B BE) → username(UTF-8) → mode(U) → path_le
 ```
 
 ## Client Usage
-### CLI Mode
+### UI Mode (single entry point)
 ```bash
-python client/src/client.py <host> <port> download <remote_path> [output_dir]
-python client/src/client.py <host> <port> upload <local_file> [remote_target_path]
+python client/src/main.py
 ```
+Menu-driven interface with prompts for server details, paths, and file operations.
 
 Defaults:
 - Download output dir: current directory (`.`)
 - Upload target path: basename of local file
 - Username: `root` (prompted if not available)
-
-### Interactive TUI Mode
-```bash
-python client/src/main.py
-```
-Menu-driven interface with prompts for server details, paths, and file operations.
 
 ## Tilde Expansion
 - Server expands `~` to the authenticated user's home directory (via `getpwnam()` lookup).

@@ -6,6 +6,7 @@ BUFFER_SIZE = 4096
 UNLOCK_SIGNAL = b"\x01"
 MODE_DOWNLOAD = b"D"
 MODE_UPLOAD = b"U"
+MODE_LIST = b"L"
 
 
 def create_socket(host, port):
@@ -135,6 +136,43 @@ def upload_to_server(host, port, username, local_file, remote_target=None):
         send_path(sock, username)
         send_mode(sock, MODE_UPLOAD)
         upload_file(sock, local_file, remote_target)
+    finally:
+        sock.close()
+
+
+def list_directory(host, port, username, remote_path):
+    """List contents of a directory on the server.
+    
+    Args:
+        host: Server hostname or IP
+        port: Server port
+        username: Username for tilde expansion on server
+        remote_path: Path to directory on server
+    
+    Returns:
+        String containing ls -la output
+    """
+    sock = create_socket(host, port)
+    try:
+        send_unlock(sock)
+        send_path(sock, username)
+        send_mode(sock, MODE_LIST)
+        send_path(sock, remote_path)
+        
+        # Check status byte
+        status_byte = recv_exact(sock, 1)
+        if status_byte[0] != 0x00:
+            raise RuntimeError("Server reported error - directory may not exist or is not accessible")
+        
+        # Read ls output until EOF
+        output = bytearray()
+        while True:
+            chunk = sock.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            output.extend(chunk)
+        
+        return output.decode('utf-8')
     finally:
         sock.close()
 

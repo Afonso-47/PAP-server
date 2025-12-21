@@ -4,7 +4,8 @@ PAP Client - Simple TUI for file transfer
 """
 import os
 import sys
-from send_file_socket import download_from_server, upload_to_server
+# UI depends on the single functions module
+from send_file_socket import download_from_server, upload_to_server, list_directory
 
 
 def clear_screen():
@@ -30,9 +31,10 @@ def main_menu():
     print_header()
     print("1. Download file from server")
     print("2. Upload file to server")
-    print("3. Exit")
+    print("3. List directory on server")
+    print("4. Exit")
     print()
-    return get_input("Select option (1-3)")
+    return get_input("Select option (1-4)")
 
 
 def download_menu():
@@ -117,6 +119,36 @@ def upload_menu():
     input("\nPress Enter to continue...")
 
 
+def list_menu():
+    clear_screen()
+    print_header()
+    print("LIST DIRECTORY ON SERVER")
+    print("-" * 60)
+    print()
+    
+    host = get_input("Server IP/hostname", "10.0.0.1")
+    port = get_input("Server port", "9001")
+    username = get_input("Username (for ~ expansion)", "root")
+    remote_path = get_input("Remote directory path (on server)", ".")
+    
+    try:
+        port = int(port)
+        print(f"\nConnecting to {host}:{port} as {username}...")
+        print(f"Listing: {remote_path}\n")
+        
+        output = list_directory(host, port, username, remote_path)
+        
+        print(output)
+    except ConnectionError as e:
+        print(f"\n✗ Connection error: {e}")
+    except RuntimeError as e:
+        print(f"\n✗ Error: {e}")
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+    
+    input("\nPress Enter to continue...")
+
+
 def main():
     while True:
         choice = main_menu()
@@ -126,11 +158,13 @@ def main():
         elif choice == "2":
             upload_menu()
         elif choice == "3":
+            list_menu()
+        elif choice == "4":
             clear_screen()
             print("Goodbye!")
             sys.exit(0)
         else:
-            print("\nInvalid option. Please select 1-3.")
+            print("\nInvalid option. Please select 1-4.")
             input("Press Enter to continue...")
 
 

@@ -15,6 +15,7 @@
 #define BUFFER_SIZE 4096
 #define MODE_DOWNLOAD 'D'
 #define MODE_UPLOAD   'U'
+#define MODE_LIST     'L'
 #define STATUS_OK 0x00
 #define STATUS_ERROR 0x01
 
@@ -274,6 +275,70 @@ static int handle_upload(int client_fd) {
     return 0;
 }
 
+static int handle_list(int client_fd) {
+    char *dir_path = recv_path_alloc(client_fd);
+    if (!dir_path) {
+        printf("Invalid or missing directory path.\n");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    char *expanded_path = expand_tilde(dir_path);
+    free(dir_path);
+    if (!expanded_path) {
+        printf("Path expansion failed.\n");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    // Build the ls command with the expanded path
+    char cmd[4096];
+    int written = snprintf(cmd, sizeof(cmd), "ls -la '%s'", expanded_path);
+    if (written < 0 || written >= (int)sizeof(cmd)) {
+        printf("Command too long.\n");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    printf("Listing directory: %s\n", expanded_path);
+    free(expanded_path);
+
+    // Execute ls and capture output
+    FILE *ls_pipe = popen(cmd, "r");
+    if (!ls_pipe) {
+        perror("popen");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    unsigned char status = STATUS_OK;
+    if (send_all(client_fd, &status, 1) <= 0) {
+        perror("send status");
+        pclose(ls_pipe);
+        return -1;
+    }
+
+    // Read ls output and send to client
+    char buffer[BUFFER_SIZE];
+    size_t nread;
+    while ((nread = fread(buffer, 1, BUFFER_SIZE, ls_pipe)) > 0) {
+        if (send_all(client_fd, buffer, nread) <= 0) {
+            perror("send ls output");
+            pclose(ls_pipe);
+            return -1;
+        }
+    }
+
+    pclose(ls_pipe);
+    printf("Directory listing sent.\n");
+    return 0;
+}
+
 int handle_unlocked_session(int client_fd) {
     char *username = recv_path_alloc(client_fd);
     if (!username) {
@@ -296,6 +361,8 @@ int handle_unlocked_session(int client_fd) {
         return handle_download(client_fd);
     } else if (mode == MODE_UPLOAD) {
         return handle_upload(client_fd);
+    } else if (mode == MODE_LIST) {
+        return handle_list(client_fd);
     }
 
     printf("Unknown mode byte: 0x%02x\n", mode);
