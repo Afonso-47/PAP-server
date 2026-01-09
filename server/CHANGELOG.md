@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-01-09 (Documentation)
+- **CODE DOCUMENTATION**: Added comprehensive comments throughout `session.c`:
+  - File header with module overview and feature list
+  - Detailed function documentation with parameters, return values, and usage examples
+  - Inline comments explaining protocol flow, critical logic, and edge cases
+  - Section dividers organizing code into logical groups (socket helpers, path utilities, protocol handlers)
+  - Special attention to the use-after-free fix with explanatory comments about pointer lifetime
+
 ## 2025-12-07 (Bugfix)
 - **CRITICAL FIX**: Fixed use-after-free bug in `session.c` `handle_download()`. 
   - Issue: `name` pointer was freed with `expanded_path` before being sent to client, resulting in garbage bytes corrupting the filename transmission.
