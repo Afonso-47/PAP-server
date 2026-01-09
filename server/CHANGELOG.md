@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-01-09
+- **TODO**: Refactor the code and make it YOURS. You need to know how it works and to be able to have the confidence to work on it yourself without Vibe Coding.
+- **NO MORE AI**:
+	- added client sided tilde and root/ expansion
+	- Windows users get the Downloads folder and that's it.
+
 ## 2026-01-09 (Documentation)
 - **CODE DOCUMENTATION**: Added comprehensive comments throughout `session.c`:
   - File header with module overview and feature list

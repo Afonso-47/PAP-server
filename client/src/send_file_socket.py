@@ -1,12 +1,58 @@
 import socket
 import sys
 import os
+import platform
 
 BUFFER_SIZE = 4096
 UNLOCK_SIGNAL = b"\x01"
 MODE_DOWNLOAD = b"D"
 MODE_UPLOAD = b"U"
 MODE_LIST = b"L"
+
+
+def get_default_download_dir():
+    """Get the default download directory based on OS.
+    
+    On Windows: Returns Downloads folder
+    On other OS: Returns current directory (.)
+    
+    Returns:
+        Path string to default download directory
+    """
+    if platform.system() == "Windows":
+        # On Windows, use the Downloads folder
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(downloads, exist_ok=True)
+        return downloads
+    else:
+        # On Linux/Mac, default to current directory
+        return "."
+
+
+def expand_path(path):
+    """Expand tilde (~) and handle absolute paths.
+    
+    Supports:
+    - ~/path → user's home directory + /path
+    - ~username/path → specified user's home + /path
+    - /path → absolute path (unchanged)
+    - relative paths → unchanged
+    
+    Args:
+        path: Path string to expand
+    
+    Returns:
+        Expanded path string
+    """
+    if not path:
+        return path
+    
+    # Handle tilde expansion
+    if path.startswith('~'):
+        return os.path.expanduser(path)
+    
+    # Return path as-is (absolute or relative)
+    return path
 
 
 def create_socket(host, port):
@@ -107,6 +153,9 @@ def download_from_server(host, port, username, remote_path, output_dir="."):
     Returns:
         Path to saved file
     """
+    # Expand local output directory path
+    output_dir = expand_path(output_dir)
+    
     sock = create_socket(host, port)
     try:
         send_unlock(sock)
@@ -130,6 +179,9 @@ def upload_to_server(host, port, username, local_file, remote_target=None):
     Returns:
         None
     """
+    # Expand local file path
+    local_file = expand_path(local_file)
+    
     sock = create_socket(host, port)
     try:
         send_unlock(sock)
@@ -150,7 +202,7 @@ def list_directory(host, port, username, remote_path):
         remote_path: Path to directory on server
     
     Returns:
-        String containing ls -la output
+        String containing directory listing (one entry per line)
     """
     sock = create_socket(host, port)
     try:
@@ -164,15 +216,24 @@ def list_directory(host, port, username, remote_path):
         if status_byte[0] != 0x00:
             raise RuntimeError("Server reported error - directory may not exist or is not accessible")
         
-        # Read ls output until EOF
-        output = bytearray()
+        # Read entries until zero-length marker
+        entries = []
         while True:
-            chunk = sock.recv(BUFFER_SIZE)
-            if not chunk:
+            len_bytes = recv_exact(sock, 4)
+            entry_len = int.from_bytes(len_bytes, byteorder='big')
+            
+            if entry_len == 0:
+                # End-of-list marker
                 break
-            output.extend(chunk)
+            
+            if entry_len > 4096:
+                raise ValueError("Invalid entry length from server")
+            
+            entry_bytes = recv_exact(sock, entry_len)
+            entry_name = entry_bytes.decode('utf-8')
+            entries.append(entry_name)
         
-        return output.decode('utf-8')
+        return '\n'.join(entries)
     finally:
         sock.close()
 

@@ -4,8 +4,9 @@ PAP Client - Simple TUI for file transfer
 """
 import os
 import sys
+import platform
 # UI depends on the single functions module
-from send_file_socket import download_from_server, upload_to_server, list_directory
+from send_file_socket import download_from_server, upload_to_server, list_directory, get_default_download_dir
 
 
 def clear_screen():
@@ -48,7 +49,13 @@ def download_menu():
     port = get_input("Server port", "9001")
     username = get_input("Username (for ~ expansion)", "root")
     remote_path = get_input("Remote file path (on server)")
-    output_dir = get_input("Local save directory", ".")
+    
+    # On Windows, default to Downloads; on other systems allow customization
+    if platform.system() == "Windows":
+        output_dir = get_default_download_dir()
+        print(f"\n(On Windows, files are saved to: {output_dir})")
+    else:
+        output_dir = get_input("Local save directory", ".")
     
     if not remote_path:
         print("\nError: Remote path is required!")
