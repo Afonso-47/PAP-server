@@ -23,10 +23,17 @@
  * around program entry/exit.
  */
 
+#ifndef _WIN32
+	#ifndef _POSIX_C_SOURCE
+		#define _POSIX_C_SOURCE 200809L
+	#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -39,6 +46,7 @@
 #else
   #include <unistd.h>
   #include <sys/types.h>
+	#include <sys/time.h>
   #include <sys/socket.h>
   #include <netdb.h>
   #include <pwd.h>

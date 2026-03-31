@@ -8,20 +8,62 @@
 
 /* ── Config ────────────────────────────────────────────────────────────── */
 
-#define HOST			"192.168.1.102"
+#define MAX_WINDOWS	32
+
+#define HOST			"192.168.1.102" // "10.0.0.1"
 #define PORT			"9001"
+
+/* ── Global Variables ─────────────────────────────────────────────────── */
 
 char username[256] = "";
 char password[256] = "";
 char current_dir[1024] = "~";
 
+WINDOW *windows[MAX_WINDOWS] = {NULL};
+
 /* ── Helpers ───────────────────────────────────────────────────────────── */
+
+/**
+ * Creates a new window with the specified dimensions and position,
+ * and stores it in the global windows array.
+ * 
+ * @param height The height of the window.
+ * @param width The width of the window.
+ * @param starty The starting y-coordinate of the window.
+ * @param startx The starting x-coordinate of the window.
+ * @return A pointer to the created window, or NULL if the maximum number of windows is reached.
+ */
+WINDOW* createWindow(int height, int width, int starty, int startx) {
+    
+    WINDOW *win = newwin(height, width, starty, startx);
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i] == NULL) {
+            windows[i] = win;
+            return win;
+        }
+    }
+    fprintf(stderr, "Error: Maximum number of windows reached.\n");
+    return NULL;
+}
+
+void disposeWindow(WINDOW *win) {
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i] == win) {
+            delwin(win);
+            windows[i] = NULL;
+            return;
+        }
+    }
+    fprintf(stderr, "Error: Window not found in global array.\n");
+}
 
 void displayLogin(WINDOW *hostwin) {
     int maxy, maxx;
     getmaxyx(hostwin, maxy, maxx);
 
-    WINDOW *loginwin = newwin(6, maxx - 2, maxy - 6, 2);
+    
+    WINDOW *loginwin = createWindow(6, maxx - 2, maxy - 7, 1);
     if (!loginwin) {
         endwin();
 
@@ -45,14 +87,18 @@ void displayLogin(WINDOW *hostwin) {
     mvwprintw(loginwin, 1, 2, "Logging in with username '%s'...", username);
     wrefresh(loginwin);
     wgetch(loginwin);
-    delwin(loginwin);
+    disposeWindow(loginwin);
 }
 
 /* ── Main ───────────────────────────────────────────────────────────── */
 
+// TODO:    Make input non blocking using nodelay() and handle input in a loop
+//          Generalize window management
+
 int main(void)
 {
     initscr();
+    windows[0] = stdscr;
     box(stdscr, 0, 0);
     refresh();
 
@@ -60,18 +106,10 @@ int main(void)
     cbreak();    /* Don't buffer keystrokes */
     keypad(stdscr, TRUE);
 
-    WINDOW *hostwin = newwin(LINES - 6, COLS - 2, 1, 1);
-    if (!hostwin) {
-        endwin();
-        fprintf(stderr, "Error creating window.\n");
-        exit(1);
-    }
-    box(hostwin, 0, 0);
-    wrefresh(hostwin);
-
-    displayLogin(hostwin);
+    displayLogin(stdscr);
 
     int ch = getch();
+    disposeWindow(windows[0]);
     endwin();
     return 0;
 }
