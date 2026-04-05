@@ -50,6 +50,7 @@
   #include <sys/socket.h>
   #include <netdb.h>
   #include <pwd.h>
+	#include <crypt.h>
   #include <sys/stat.h>
   typedef int sock_t;
   #define CLOSE_SOCK(s) close(s)
@@ -90,6 +91,7 @@
 #define ERR_MODE        16   /* send_mode() failed                         */
 #define ERR_REMOTE_PATH 32   /* send_path() for remote file/dir failed     */
 #define ERR_TRANSFER    64   /* upload_file() / receive_file() failed      */
+#define ERR_AUTH       128   /* authentication failed                       */
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 
@@ -336,6 +338,90 @@ int send_path(sock_t sock, const char *path)
 		return -1;
 
 	return send_all(sock, (const unsigned char *)path, path_len);
+}
+
+/**
+ * recv_path_alloc_sock - Receive a length-prefixed UTF-8 string from socket.
+ *
+ * Wire format: [4-byte big-endian length][bytes].
+ *
+ * @param sock  Connected socket.
+ * @return      Heap-allocated NUL-terminated string, or NULL on error.
+ */
+static char *recv_path_alloc_sock(sock_t sock)
+{
+	unsigned char len_buf[4];
+	if (recv_exact(sock, len_buf, 4) != 0)
+		return NULL;
+
+	uint32_t len = be_to_uint32(len_buf);
+	if (len == 0 || len > MAX_PATH_LEN)
+		return NULL;
+
+	char *out = malloc((size_t)len + 1);
+	if (!out)
+		return NULL;
+
+	if (recv_exact(sock, (unsigned char *)out, len) != 0) {
+		free(out);
+		return NULL;
+	}
+
+	out[len] = '\0';
+	return out;
+}
+
+/**
+ * authenticate_with_server - Perform password-hash authentication handshake.
+ *
+ * Server sends a crypt setting (salt+algorithm string). Client computes
+ * crypt(password, setting), sends the resulting hash, then waits for status.
+ *
+ * @param sock      Connected socket, right after sending username.
+ * @param password  Plaintext password entered by user.
+ * @return          0 on success, -1 on failure.
+ */
+static int authenticate_with_server(sock_t sock, const char *password)
+{
+	if (!password || password[0] == '\0') {
+		fprintf(stderr, "authenticate: empty password\n");
+		return -1;
+	}
+
+#ifdef _WIN32
+	(void)sock;
+	fprintf(stderr, "authenticate: not supported on Windows build\n");
+	return -1;
+#else
+	char *setting = recv_path_alloc_sock(sock);
+	if (!setting) {
+		fprintf(stderr, "authenticate: failed to receive auth challenge\n");
+		return -1;
+	}
+
+	char *pw_hash = crypt(password, setting);
+	if (!pw_hash) {
+		free(setting);
+		fprintf(stderr, "authenticate: crypt() failed\n");
+		return -1;
+	}
+
+	if (send_path(sock, pw_hash) != 0) {
+		free(setting);
+		fprintf(stderr, "authenticate: failed to send hash\n");
+		return -1;
+	}
+
+	free(setting);
+
+	unsigned char status;
+	if (recv_exact(sock, &status, 1) != 0 || status != 0x00) {
+		fprintf(stderr, "authenticate: server rejected credentials\n");
+		return -1;
+	}
+
+	return 0;
+#endif
 }
 
 /* ── File transfer ───────────────────────────────────────────────────────── */
@@ -686,6 +772,7 @@ char *expand_path(const char *path, char *out, size_t out_size)
 int download_from_server(const char *host,
 						 const char *port,
 						 const char *username,
+						 const char *password,
 						 const char *remote_path,
 						 const char *output_dir,
 						 char       *out_path)
@@ -701,13 +788,15 @@ int download_from_server(const char *host,
 	int rc = ERR_NONE;
 	if (send_unlock(sock) != 0)
 		rc |= ERR_UNLOCK;
-	if (send_path(sock, username) != 0)
+	if (rc == ERR_NONE && send_path(sock, username) != 0)
 		rc |= ERR_PATH;
-	if (send_mode(sock, MODE_DOWNLOAD) != 0)
+	if (rc == ERR_NONE && authenticate_with_server(sock, password) != 0)
+		rc |= ERR_AUTH;
+	if (rc == ERR_NONE && send_mode(sock, MODE_DOWNLOAD) != 0)
 		rc |= ERR_MODE;
-	if (send_path(sock, remote_path) != 0)
+	if (rc == ERR_NONE && send_path(sock, remote_path) != 0)
 		rc |= ERR_REMOTE_PATH;
-	if (receive_file(sock, expanded_dir, out_path) != 0)
+	if (rc == ERR_NONE && receive_file(sock, expanded_dir, out_path) != 0)
 		rc |= ERR_TRANSFER;
 
 	CLOSE_SOCK(sock);
@@ -738,6 +827,7 @@ int download_from_server(const char *host,
 int upload_to_server(const char *host,
 					 const char *port,
 					 const char *username,
+					 const char *password,
 					 const char *local_file,
 					 const char *remote_target)
 {
@@ -752,11 +842,13 @@ int upload_to_server(const char *host,
 	int rc = ERR_NONE;
 	if (send_unlock(sock) != 0)
 		rc |= ERR_UNLOCK;
-	if (send_path(sock, username) != 0)
+	if (rc == ERR_NONE && send_path(sock, username) != 0)
 		rc |= ERR_PATH;
-	if (send_mode(sock, MODE_UPLOAD) != 0)
+	if (rc == ERR_NONE && authenticate_with_server(sock, password) != 0)
+		rc |= ERR_AUTH;
+	if (rc == ERR_NONE && send_mode(sock, MODE_UPLOAD) != 0)
 		rc |= ERR_MODE;
-	if (upload_file(sock, expanded_file, remote_target) != 0)
+	if (rc == ERR_NONE && upload_file(sock, expanded_file, remote_target) != 0)
 		rc |= ERR_TRANSFER;
 
 	CLOSE_SOCK(sock);
@@ -784,6 +876,7 @@ int upload_to_server(const char *host,
 char *list_directory(const char *host,
 					 const char *port,
 					 const char *username,
+					 const char *password,
 					 const char *remote_path)
 {
 	sock_t sock = create_socket(host, port);
@@ -791,9 +884,10 @@ char *list_directory(const char *host,
 		return NULL;
 
 	char *result = NULL;
-	if (send_unlock(sock)           == 0 &&
-		send_path(sock, username)   == 0 &&
-		send_mode(sock, MODE_LIST)  == 0)
+	if (send_unlock(sock)                    == 0 &&
+		send_path(sock, username)            == 0 &&
+		authenticate_with_server(sock, password) == 0 &&
+		send_mode(sock, MODE_LIST)           == 0)
 	{
 		result = list_directory_sock(sock, remote_path);
 	}

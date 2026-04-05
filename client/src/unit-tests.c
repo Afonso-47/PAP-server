@@ -8,9 +8,10 @@
 
 /* ── Config ────────────────────────────────────────────────────────────── */
 
-#define HOST			"192.168.1.102"
+#define HOST			"10.0.0.1"
 #define PORT			"9001"
 #define USERNAME		"root"
+#define PASSWORD		"ServerXONXOmj7576«p»"
 #define LOCAL_FILE		"./test.txt"
 #define REMOTE_TARGET	"/root/temp.txt"
 #define DOWNLOAD_DIR	"./downloads"
@@ -36,6 +37,7 @@ static void print_err_bits(int rc)
 	if (rc & ERR_MODE)         printw("  [ERR] ERR_MODE         – sending mode byte failed\n");
 	if (rc & ERR_REMOTE_PATH)  printw("  [ERR] ERR_REMOTE_PATH  – sending remote path failed\n");
 	if (rc & ERR_TRANSFER)     printw("  [ERR] ERR_TRANSFER     – file transfer failed\n");
+	if (rc & ERR_AUTH)         printw("  [ERR] ERR_AUTH         – authentication failed\n");
 }
 
 /**
@@ -77,7 +79,7 @@ static void test_upload(void)
 	printw("Uploading...\n");
 	refresh();
 
-	int rc = upload_to_server(HOST, PORT, USERNAME, LOCAL_FILE, REMOTE_TARGET);
+	int rc = upload_to_server(HOST, PORT, USERNAME, PASSWORD, LOCAL_FILE, REMOTE_TARGET);
 
 	printw("\nResult (rc = %d):\n", rc);
 	print_err_bits(rc);
@@ -142,7 +144,7 @@ static void test_download(void)
 	refresh();
 
 	char saved_path[MAX_PATH_LEN + 1] = {0};
-	int rc = download_from_server(HOST, PORT, USERNAME,
+	int rc = download_from_server(HOST, PORT, USERNAME, PASSWORD,
 	                              REMOTE_TARGET, DOWNLOAD_DIR, saved_path);
 
 	printw("\nResult (rc = %d):\n", rc);
@@ -181,7 +183,7 @@ static void test_list(void)
 	printw("Listing...\n");
 	refresh();
 
-	char *listing = list_directory(HOST, PORT, USERNAME, LIST_PATH);
+	char *listing = list_directory(HOST, PORT, USERNAME, PASSWORD, LIST_PATH);
 
 	if (!listing) {
 		printw("\n  [ERR] list_directory() returned NULL.\n");

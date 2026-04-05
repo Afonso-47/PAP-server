@@ -12,6 +12,10 @@
  * - Status byte error reporting (0x00=OK, 0x01=ERROR)
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +28,12 @@
 #include <pwd.h>
 #include <wordexp.h>
 #include <dirent.h>
+#include <limits.h>
+#include <shadow.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #include "session.h"
 
@@ -117,6 +127,19 @@ static int send_all(int fd, const void *buf, size_t len) {
         total += n;
     }
     return (int)total;
+}
+
+/**
+ * @brief Send a length-prefixed string to socket (4-byte BE length + bytes)
+ */
+static int send_path_raw(int fd, const char *s) {
+    uint32_t len = (uint32_t)strlen(s);
+    if (len == 0 || len > 4096) return -1;
+
+    uint32_t len_be = htonl(len);
+    if (send_all(fd, &len_be, sizeof(len_be)) <= 0) return -1;
+    if (send_all(fd, s, len) <= 0) return -1;
+    return 0;
 }
 
 /* ========== Path Manipulation Utilities ========== */
@@ -251,6 +274,162 @@ static int ensure_parent_dirs(const char *path) {
     return 0;
 }
 
+/**
+ * @brief Get current authenticated user's home directory and root status
+ */
+static int get_user_home(char *home_out, size_t out_size, int *is_root_out) {
+    struct passwd *pw = getpwnam(current_username);
+    if (!pw || !pw->pw_dir) return -1;
+
+    if (strlen(pw->pw_dir) >= out_size) return -1;
+    strcpy(home_out, pw->pw_dir);
+    *is_root_out = (pw->pw_uid == 0) ? 1 : 0;
+    return 0;
+}
+
+/**
+ * @brief Check whether path is equal to or inside base directory
+ */
+static int path_is_within(const char *path, const char *base) {
+    size_t base_len = strlen(base);
+    if (strncmp(path, base, base_len) != 0) return 0;
+    return path[base_len] == '\0' || path[base_len] == '/';
+}
+
+/**
+ * @brief Resolve the closest existing ancestor of a path
+ */
+static int resolve_existing_ancestor(const char *path, char *resolved, size_t resolved_size) {
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(tmp)) return -1;
+    memcpy(tmp, path, len + 1);
+
+    while (1) {
+        char *rp = realpath(tmp, resolved);
+        if (rp) {
+            if (strlen(resolved) >= resolved_size) return -1;
+            return 0;
+        }
+
+        char *slash = strrchr(tmp, '/');
+        if (!slash) return -1;
+
+        if (slash == tmp) {
+            strcpy(tmp, "/");
+        } else {
+            *slash = '\0';
+        }
+    }
+}
+
+/**
+ * @brief Enforce per-user path policy (non-root users restricted to home)
+ */
+static int enforce_user_path_policy(const char *expanded_path, int for_upload) {
+    char user_home[PATH_MAX];
+    int is_root = 0;
+
+    if (get_user_home(user_home, sizeof(user_home), &is_root) != 0) {
+        return -1;
+    }
+    if (is_root) {
+        return 0;
+    }
+
+    if (expanded_path[0] != '/') {
+        return -1;
+    }
+
+    char resolved_home[PATH_MAX];
+    if (!realpath(user_home, resolved_home)) {
+        return -1;
+    }
+
+    char resolved_target[PATH_MAX];
+    int ok;
+    if (for_upload) {
+        if (resolve_existing_ancestor(expanded_path, resolved_target, sizeof(resolved_target)) != 0) {
+            return -1;
+        }
+        ok = path_is_within(resolved_target, resolved_home);
+    } else {
+        if (!realpath(expanded_path, resolved_target)) {
+            return -1;
+        }
+        ok = path_is_within(resolved_target, resolved_home);
+    }
+
+    return ok ? 0 : -1;
+}
+
+/**
+ * @brief Extract crypt setting (algorithm+salt) from shadow hash
+ */
+static int extract_crypt_setting(const char *stored_hash, char *out, size_t out_size) {
+    if (!stored_hash || stored_hash[0] == '\0') return -1;
+
+    // Modern modular format: $id$[params$]salt$hash
+    if (stored_hash[0] == '$') {
+        const char *last_dollar = strrchr(stored_hash, '$');
+        if (!last_dollar || last_dollar == stored_hash) return -1;
+
+        size_t setting_len = (size_t)(last_dollar - stored_hash) + 1; // include trailing '$'
+        if (setting_len >= out_size) return -1;
+        memcpy(out, stored_hash, setting_len);
+        out[setting_len] = '\0';
+        return 0;
+    }
+
+    // Legacy DES format uses first two chars as salt
+    if (strlen(stored_hash) < 2 || out_size < 3) return -1;
+    out[0] = stored_hash[0];
+    out[1] = stored_hash[1];
+    out[2] = '\0';
+    return 0;
+}
+
+/**
+ * @brief Authenticate current user with password hash response
+ */
+static int authenticate_user(int client_fd) {
+    struct spwd *sp = getspnam(current_username);
+    if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '\0' ||
+        sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    char setting[512];
+    if (extract_crypt_setting(sp->sp_pwdp, setting, sizeof(setting)) != 0) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (send_path_raw(client_fd, setting) != 0) {
+        return -1;
+    }
+
+    char *client_hash = recv_path_alloc(client_fd);
+    if (!client_hash) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    int ok = (strcmp(client_hash, sp->sp_pwdp) == 0);
+    free(client_hash);
+
+    unsigned char status = ok ? STATUS_OK : STATUS_ERROR;
+    if (send_all(client_fd, &status, 1) <= 0) {
+        return -1;
+    }
+
+    return ok ? 0 : -1;
+}
+
 /* ========== Protocol Mode Handlers ========== */
 
 /**
@@ -287,6 +466,14 @@ static int handle_download(int client_fd) {
         printf("Path expansion failed.\n");
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (enforce_user_path_policy(expanded_path, 0) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
         return -1;
     }
 
@@ -403,9 +590,19 @@ static int handle_upload(int client_fd) {
         return -1;
     }
 
+    if (enforce_user_path_policy(expanded_path, 1) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
     // Step 3: Create parent directories if they don't exist
     if (ensure_parent_dirs(expanded_path) != 0) {
         perror("mkdir");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
         free(expanded_path);
         return -1;
     }
@@ -489,6 +686,14 @@ static int handle_list(int client_fd) {
 		send_all(client_fd, &status, 1);
 		return -1;
 	}
+
+    if (enforce_user_path_policy(expanded_path, 0) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
 
 	// Step 3: Open directory for reading
 	DIR *dir = opendir(expanded_path);
@@ -575,7 +780,13 @@ int handle_unlocked_session(int client_fd) {
     printf("Authenticated as user: %s\n", current_username);
     free(username);
 
-    // Step 2: Receive mode byte to determine operation
+    // Step 2: Authenticate password hash against system shadow entry
+    if (authenticate_user(client_fd) != 0) {
+        printf("Authentication failed for user: %s\n", current_username);
+        return -1;
+    }
+
+    // Step 3: Receive mode byte to determine operation
     unsigned char mode;
     int n = recv_exact(client_fd, &mode, 1);
     if (n <= 0) {
@@ -583,7 +794,7 @@ int handle_unlocked_session(int client_fd) {
         return -1;
     }
 
-    // Step 3: Dispatch to appropriate handler
+    // Step 4: Dispatch to appropriate handler
     if (mode == MODE_DOWNLOAD) {
         return handle_download(client_fd);
     } else if (mode == MODE_UPLOAD) {
