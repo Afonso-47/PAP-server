@@ -8,7 +8,7 @@
 
 /* ── Config ────────────────────────────────────────────────────────────── */
 
-#define HOST			"10.0.0.1"
+#define HOST			/* "10.0.0.1" /*/ "192.168.1.102" /**/
 #define PORT			"9001"
 #define USERNAME		"root"
 #define PASSWORD		"ServerXONXOmj7576«p»"
