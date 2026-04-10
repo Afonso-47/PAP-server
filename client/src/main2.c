@@ -1,10 +1,14 @@
 #include "./send-file-socket.c"
 
+#include <locale.h>
 #include <ncurses.h>
+#include <assert.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ── DEBUG ────────────────────────────────────────────────────── */
-#define DEBUG 1
+#define DEBUG 0
 
 /* ── Network target ────────────────────────────────────────────────────── */
 #define SERVER_ADDRESS "192.168.1.102"
@@ -50,6 +54,265 @@ static struct input_state g_input = {
     .max_length      = INPUT_BUF_MAX,
     .cursor_position = 0
 };
+
+
+enum SPRITES
+{
+    MOVE_UP,
+    FOLDER,
+    EMPTY_FOLDER,
+    NEW_FOLDER,
+    GENERIC_FILE,
+    TEXT_FILE,
+    BIN_FILE,
+    CODE_FILE,
+    HTML_FILE,
+    LINK_FILE,
+    VIDEO_FILE,
+    AUDIO_FILE,
+    IMAGE_FILE,
+    ZIP_FILE,
+    NEW_FILE,
+    SPRITE_COUNT
+};
+
+#define SPRITE_HEIGHT 4
+#define SPRITE_WIDTH  8
+#define TILE_WIDTH    24
+#define TILE_HEIGHT   6
+#define LIST_TOP_ROW  6
+
+typedef struct
+{
+    const char *rows[SPRITE_HEIGHT];
+} Sprite;
+
+static const Sprite SPRITE_TABLE[SPRITE_COUNT] =
+{
+    [MOVE_UP] = { .rows = {
+        "  .^.   ",
+        " /   \\  ",
+        "'─┐ ┌─' ",
+        "  └─┘   "
+    }},
+    [FOLDER] = { .rows = {
+        "┌──┐___.",
+        "│      │",
+        "│      │",
+        "└──────┘"
+    }},
+    [EMPTY_FOLDER] = { .rows = {
+        "┌──┐___.",
+        "│  └───┤",
+        "│      │",
+        "└──────┘"
+    }},
+    [NEW_FOLDER] = { .rows = {
+        "  ┌─┐   ",
+        "┌─┘ └─┐ ",
+        "└─┐ ┌─┘ ",
+        "  └─┘   "
+    }},
+    [GENERIC_FILE] = { .rows = {
+        "┌────.  ",
+        "│     \\ ",
+        "│     │ ",
+        "└─────┘ "
+    }},
+    [TEXT_FILE] = { .rows = {
+        "┌────.  ",
+        "│ --- \\ ",
+        "│ --- │ ",
+        "└─────┘ "
+    }},
+    [BIN_FILE] = { .rows = {
+        "┌────.  ",
+        "│ ... \\ ",
+        "│ ... │ ",
+        "└─────┘ "
+    }},
+    [CODE_FILE] = { .rows = {
+        "┌────.  ",
+        "│     \\ ",
+        "│ py  │ ",
+        "└─────┘ "
+    }},
+    [HTML_FILE] = { .rows = {
+        "┌────.  ",
+        "│     \\ ",
+        "│ </> │ ",
+        "└─────┘ "
+    }},
+    [LINK_FILE] = { .rows = {
+        "┌────.  ",
+        "│     \\ ",
+        "│ ./  │ ",
+        "└─────┘ "
+    }},
+    [VIDEO_FILE] = { .rows = {
+        "┌────.  ",
+        "│ |\\  \\ ",
+        "│ |/  │ ",
+        "└─────┘ "
+    }},
+    [AUDIO_FILE] = { .rows = {
+        "┌────.  ",
+        "│  ┌~ \\ ",
+        "│ O┘  │ ",
+        "└─────┘ "
+    }},
+    [IMAGE_FILE] = { .rows = {
+        "┌────.  ",
+        "│ /\\ o\\ ",
+        "│/  \\/│ ",
+        "└─────┘ "
+    }},
+    [ZIP_FILE] = { .rows = {
+        "┌────.  ",
+        "│.  ┴ \\ ",
+        "│.  ┴ │ ",
+        "└───┴─┘ "
+    }},
+    [NEW_FILE] = { .rows = {
+        "  ┌─┐   ",
+        "┌─┘ └─┐ ",
+        "└─┐ ┌─┘ ",
+        "  └─┘   "
+    }},
+};
+
+static const Sprite *get_sprite(enum SPRITES id)
+{
+    if (id < 0 || id >= SPRITE_COUNT) return NULL;
+    return &SPRITE_TABLE[id];
+}
+
+static void draw_sprite(int row, int col, enum SPRITES id)
+{
+    const Sprite *sprite = get_sprite(id);
+    if (!sprite)
+        return;
+
+    for (int i = 0; i < SPRITE_HEIGHT; i++)
+        mvaddstr(row + i, col, sprite->rows[i]);
+}
+
+static enum SPRITES classify_sprite(const char *name)
+{
+    const char *ext;
+
+    if (!name || !name[0])
+        return GENERIC_FILE;
+
+    if (strcmp(name, "..") == 0)
+        return MOVE_UP;
+
+    if (strcmp(name, ".") == 0)
+        return MOVE_UP;
+
+    ext = strrchr(name, '.');
+    if (!ext || ext == name)
+        return GENERIC_FILE;
+
+    if (strcasecmp(ext, ".txt") == 0 ||
+        strcasecmp(ext, ".md") == 0 ||
+        strcasecmp(ext, ".log") == 0)
+        return TEXT_FILE;
+
+    if (strcasecmp(ext, ".c") == 0 ||
+        strcasecmp(ext, ".h") == 0 ||
+        strcasecmp(ext, ".cpp") == 0 ||
+        strcasecmp(ext, ".hpp") == 0 ||
+        strcasecmp(ext, ".py") == 0 ||
+        strcasecmp(ext, ".js") == 0 ||
+        strcasecmp(ext, ".ts") == 0 ||
+        strcasecmp(ext, ".java") == 0)
+        return CODE_FILE;
+
+    if (strcasecmp(ext, ".html") == 0 ||
+        strcasecmp(ext, ".htm") == 0)
+        return HTML_FILE;
+
+    if (strcasecmp(ext, ".zip") == 0 ||
+        strcasecmp(ext, ".tar") == 0 ||
+        strcasecmp(ext, ".gz") == 0 ||
+        strcasecmp(ext, ".7z") == 0 ||
+        strcasecmp(ext, ".rar") == 0)
+        return ZIP_FILE;
+
+    if (strcasecmp(ext, ".png") == 0 ||
+        strcasecmp(ext, ".jpg") == 0 ||
+        strcasecmp(ext, ".jpeg") == 0 ||
+        strcasecmp(ext, ".gif") == 0 ||
+        strcasecmp(ext, ".webp") == 0 ||
+        strcasecmp(ext, ".svg") == 0)
+        return IMAGE_FILE;
+
+    if (strcasecmp(ext, ".mp4") == 0 ||
+        strcasecmp(ext, ".mkv") == 0 ||
+        strcasecmp(ext, ".avi") == 0 ||
+        strcasecmp(ext, ".mov") == 0)
+        return VIDEO_FILE;
+
+    if (strcasecmp(ext, ".mp3") == 0 ||
+        strcasecmp(ext, ".wav") == 0 ||
+        strcasecmp(ext, ".ogg") == 0 ||
+        strcasecmp(ext, ".flac") == 0)
+        return AUDIO_FILE;
+
+    if (strcasecmp(ext, ".lnk") == 0 ||
+        strcasecmp(ext, ".url") == 0)
+        return LINK_FILE;
+
+    if (strcasecmp(ext, ".bin") == 0 ||
+        strcasecmp(ext, ".dat") == 0)
+        return BIN_FILE;
+
+    return GENERIC_FILE;
+}
+
+static int parse_listing_entries(const char *listing, char ***entries_out)
+{
+    char  *copy;
+    char  *tok;
+    char **entries = NULL;
+    int    count = 0;
+
+    *entries_out = NULL;
+    if (!listing || !listing[0])
+        return 0;
+
+    copy = strdup(listing);
+    if (!copy)
+        return 0;
+
+    tok = strtok(copy, "\n");
+    while (tok)
+    {
+        char **tmp = realloc(entries, (size_t)(count + 1) * sizeof(*entries));
+        if (!tmp)
+            break;
+
+        entries = tmp;
+        entries[count] = strdup(tok);
+        if (!entries[count])
+            break;
+
+        count++;
+        tok = strtok(NULL, "\n");
+    }
+
+    free(copy);
+    *entries_out = entries;
+    return count;
+}
+
+static void free_listing_entries(char **entries, int count)
+{
+    for (int i = 0; i < count; i++)
+        free(entries[i]);
+    free(entries);
+}
 
 /* ── Stored credential strings (plain buffers, not input_states) ─────────── */
 static char username[INPUT_BUF_MAX] = {0};
@@ -212,6 +475,60 @@ static void show_explorer_header(char *ip_address, char *uname, char *current_di
     free(header_text);
 }
 
+
+
+static int show_explorer_listing(char *listing, int *current_page_zero_based)
+{
+    char **entries = NULL;
+    int count = parse_listing_entries(listing, &entries);
+
+    int width = getmaxx(stdscr);
+    int height = getmaxy(stdscr);
+    int available_width = width - 2;
+    int available_height = (height - 2) - LIST_TOP_ROW;
+    int cols = available_width / TILE_WIDTH;
+    int rows = available_height / TILE_HEIGHT;
+    int per_page;
+    int page_count;
+    int page;
+    int start;
+
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+
+    per_page = cols * rows;
+    page_count = (count <= 0) ? 1 : ((count + per_page - 1) / per_page);
+
+    page = *current_page_zero_based;
+    if (page < 0) page = 0;
+    if (page >= page_count) page = page_count - 1;
+    *current_page_zero_based = page;
+
+    if (count == 0)
+    {
+        mvprintw(LIST_TOP_ROW, 2, "No items in this directory.");
+        free_listing_entries(entries, count);
+        return page_count;
+    }
+
+    start = page * per_page;
+    for (int i = 0; i < per_page && (start + i) < count; i++)
+    {
+        int grid_row = i / cols;
+        int grid_col = i % cols;
+        int draw_row = LIST_TOP_ROW + (grid_row * TILE_HEIGHT);
+        int draw_col = 2 + (grid_col * TILE_WIDTH);
+        enum SPRITES sprite = classify_sprite(entries[start + i]);
+
+        draw_sprite(draw_row, draw_col, sprite);
+        mvprintw(draw_row + SPRITE_HEIGHT, draw_col, "%-20.20s", entries[start + i]);
+    }
+
+    free_listing_entries(entries, count);
+    return page_count;
+
+}
+
 static void show_explorer_footer(void)
 {
     int width = getmaxx(stdscr);
@@ -219,8 +536,8 @@ static void show_explorer_footer(void)
     move(getmaxy(stdscr) - 2, 0);
     for (int i = 0; i < width; ++i) addch('-');
 
-    // TODO: Implement Refresh and Move, and Pagination, and everything except Esc to Quit.
-    mvprintw(getmaxy(stdscr) - 1, 0, "Commands: [Esc] Quit | [R] Refresh | [Up/Down] Navigate");
+    mvprintw(getmaxy(stdscr) - 1, 0,
+             "Commands: [Esc] Quit | [R] Refresh | [Left/Right] Page");
 }
 
 /* ── Application state ──────────────────────────────────────────────────── */
@@ -231,6 +548,8 @@ typedef enum { STATE_LOGIN, STATE_EXPLORER } AppState;
 
 int main(void)
 {
+    setlocale(LC_ALL, "");
+
     initscr();
     noecho();
     cbreak();
@@ -244,6 +563,8 @@ int main(void)
     char     debug_message[256] = {0};
     debug_message[0] = '\0';
     char *listing = NULL;
+    int explorer_page = 0;
+    int explorer_max_pages = 1;
 
     while (1)
     {
@@ -298,7 +619,9 @@ int main(void)
             if (needs_full_redraw)
             {
                 clear();
-                show_explorer_header(SERVER_ADDRESS, username, "~", 1, 1, debug_message);
+                explorer_max_pages = show_explorer_listing(listing, &explorer_page);
+                show_explorer_header(SERVER_ADDRESS, username, "~",
+                                     explorer_page + 1, explorer_max_pages, debug_message);
                 show_explorer_footer();
                 wrefresh(stdscr);
                 needs_full_redraw = false;
@@ -351,10 +674,8 @@ int main(void)
 
                     if (listing != NULL)
                     {
-                        clear();
-                        mvprintw(0, 0, "Directory listing:\n%s", listing);
-                        free(listing);
-                        wrefresh(stdscr);
+                        explorer_page     = 0;
+                        explorer_max_pages = 1;
                         app_state         = STATE_EXPLORER;
                         needs_full_redraw = true;
                     }
@@ -376,9 +697,42 @@ int main(void)
                 }
             }
         }
-        /* STATE_EXPLORER input handling goes here in a future iteration. */
+        else if (app_state == STATE_EXPLORER)
+        {
+            if (ch == KEY_RIGHT)
+            {
+                if (explorer_page + 1 < explorer_max_pages)
+                {
+                    explorer_page++;
+                    needs_full_redraw = true;
+                }
+            }
+            else if (ch == KEY_LEFT)
+            {
+                if (explorer_page > 0)
+                {
+                    explorer_page--;
+                    needs_full_redraw = true;
+                }
+            }
+            else if (ch == 'r' || ch == 'R')
+            {
+                char *new_listing = list_directory(
+                    SERVER_ADDRESS, SERVER_PORT,
+                    username, password, "~");
+
+                if (new_listing)
+                {
+                    free(listing);
+                    listing = new_listing;
+                    explorer_page = 0;
+                    needs_full_redraw = true;
+                }
+            }
+        }
     }
 
+    free(listing);
     endwin();
     return 0;
 }
