@@ -3,6 +3,9 @@
 #include <ncurses.h>
 #include <string.h>
 
+/* ── DEBUG ────────────────────────────────────────────────────── */
+#define DEBUG 1
+
 /* ── Network target ────────────────────────────────────────────────────── */
 #define SERVER_ADDRESS "192.168.1.102"
 #define SERVER_PORT    "9001"
@@ -19,7 +22,9 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * struct input_state
  *
- * Encapsulates everything needed to manage a single text-input field:
+ * A single, reusable input slot.  Only one field is "live" at a time;
+ * when focus moves away, flush_input_to() copies the buffer into a plain
+ * char[] and resets this struct for the next field.
  *
  *   buffer          – Null-terminated character array holding the typed text.
  *   length          – Number of characters currently in the buffer
@@ -29,9 +34,6 @@
  *                     length >= max_length - 1.
  *   cursor_position – Logical index within `buffer` at which the next
  *                     keystroke will be inserted (0 … length, inclusive).
- *                     Moving left/right adjusts this independently of the
- *                     ncurses screen cursor, which is re-synced after every
- *                     redraw.
  * ═══════════════════════════════════════════════════════════════════════════ */
 struct input_state
 {
@@ -41,33 +43,69 @@ struct input_state
     int  cursor_position;
 };
 
+/* ── Single global input slot ───────────────────────────────────────────── */
+static struct input_state g_input = {
+    .buffer          = {0},
+    .length          = 0,
+    .max_length      = INPUT_BUF_MAX,
+    .cursor_position = 0
+};
+
+/* ── Stored credential strings (plain buffers, not input_states) ─────────── */
+static char username[INPUT_BUF_MAX] = {0};
+static char password[INPUT_BUF_MAX] = {0};
+
 /* ── Helpers ────────────────────────────────────────────────────────────── */
+
+/**
+ * flush_input_to – Copies g_input.buffer into `dest` then resets g_input.
+ *
+ * Call this whenever focus leaves a field so that the typed value is
+ * preserved in a plain string while the shared slot is ready for the
+ * next field.
+ */
+static void flush_input_to(char *dest)
+{
+    memcpy(dest, g_input.buffer, (size_t)(g_input.length + 1)); /* +1 for '\0' */
+    memset(&g_input, 0, sizeof g_input);
+    g_input.max_length = INPUT_BUF_MAX;
+}
+
+/**
+ * load_input_from – Loads a previously stored string back into g_input.
+ *
+ * Call this when returning focus to a field that was already filled in,
+ * so the user can continue editing where they left off.
+ */
+static void load_input_from(const char *src)
+{
+    int len = (int)strlen(src);
+    memcpy(g_input.buffer, src, (size_t)(len + 1));
+    g_input.length          = len;
+    g_input.cursor_position = len;   /* Place cursor at the end. */
+    g_input.max_length      = INPUT_BUF_MAX;
+}
 
 /**
  * redraw_field – Repaints a single input field in place.
  *
  * Moves to (row, INPUT_COL), clears to end-of-line, then reprints every
- * character (or '*' when hide_input is true).  Finally positions the
- * screen cursor at the logical cursor_position so ncurses blinking cursor
- * matches where the next character will land.
- *
- * Separating drawing from input handling avoids the fragile "print one
- * char at a time and hope the cursor stays in sync" approach.
+ * character in g_input (or '*' when hide_input is true).  Finally
+ * positions the screen cursor at the logical cursor_position.
  */
-static void redraw_field(int row, bool hide_input, const struct input_state *state)
+static void redraw_field(int row, bool hide_input)
 {
     move(row, INPUT_COL);
     clrtoeol();
 
-    for (int i = 0; i < state->length; i++)
-        addch(hide_input ? '*' : (unsigned char)state->buffer[i]);
+    for (int i = 0; i < g_input.length; i++)
+        addch(hide_input ? '*' : (unsigned char)g_input.buffer[i]);
 
-    /* Re-position the hardware cursor to match the logical cursor. */
-    move(row, INPUT_COL + state->cursor_position);
+    move(row, INPUT_COL + g_input.cursor_position);
 }
 
 /**
- * handle_input – Applies one keypress to an input_state.
+ * handle_input – Applies one keypress to g_input.
  *
  * Does NOT touch the screen; the caller is responsible for calling
  * redraw_field() afterwards so the display stays consistent with the
@@ -83,134 +121,129 @@ static void redraw_field(int row, bool hide_input, const struct input_state *sta
  * Returns true if the buffer was modified (so the caller can decide
  * whether a redraw is necessary).
  */
-static bool handle_input(int ch, struct input_state *state)
+static bool handle_input(int ch)
 {
     if (ch == KEY_BACKSPACE || ch == 127)
     {
-        /* Nothing to delete when cursor is already at the start. */
-        if (state->cursor_position == 0)
+        if (g_input.cursor_position == 0)
             return false;
 
-        /*
-         * Shift every character from cursor onward one step to the left,
-         * overwriting the character that was immediately left of the cursor.
-         */
-        int del = state->cursor_position - 1;
-        memmove(&state->buffer[del],
-                &state->buffer[del + 1],
-                (size_t)(state->length - del)); /* includes '\0' */
+        int del = g_input.cursor_position - 1;
+        memmove(&g_input.buffer[del],
+                &g_input.buffer[del + 1],
+                (size_t)(g_input.length - del)); /* includes '\0' */
 
-        state->cursor_position--;
-        state->length--;
+        g_input.cursor_position--;
+        g_input.length--;
         return true;
     }
 
     if (ch == KEY_LEFT)
     {
-        if (state->cursor_position > 0)
-        {
-            state->cursor_position--;
-            return true;
-        }
+        if (g_input.cursor_position > 0) { g_input.cursor_position--; return true; }
         return false;
     }
 
     if (ch == KEY_RIGHT)
     {
-        /* Cursor may reach `length` (after the last char) but no further. */
-        if (state->cursor_position < state->length)
-        {
-            state->cursor_position++;
-            return true;
-        }
+        if (g_input.cursor_position < g_input.length) { g_input.cursor_position++; return true; }
         return false;
     }
 
-    /*
-     * Accept any non-control byte: standard printable ASCII (32–126),
-     * DEL is excluded (127 = backspace alias, handled above), and all
-     * high bytes (128–255) which are valid UTF-8 continuation or lead
-     * bytes delivered one at a time by ncurses.
-     *
-     * This matters for passwords containing multibyte characters such as
-     * «, », é, ü, etc.  ncurses splits each UTF-8 sequence into
-     * individual getch() calls, so we store the raw bytes and let the
-     * server interpret the encoding.
-     */
     if ((ch >= 32 && ch < 127) || (ch >= 128 && ch <= 255))
     {
-        if (state->length >= state->max_length - 1)
-            return false; /* Buffer full – silently drop. */
+        if (g_input.length >= g_input.max_length - 1)
+            return false;
 
-        /*
-         * Make room: shift everything from cursor to end one step right,
-         * then write the new character.  memmove handles the +1 for '\0'.
-         */
-        memmove(&state->buffer[state->cursor_position + 1],
-                &state->buffer[state->cursor_position],
-                (size_t)(state->length - state->cursor_position + 1));
+        memmove(&g_input.buffer[g_input.cursor_position + 1],
+                &g_input.buffer[g_input.cursor_position],
+                (size_t)(g_input.length - g_input.cursor_position + 1));
 
-        state->buffer[state->cursor_position] = (char)ch;
-        state->cursor_position++;
-        state->length++;
+        g_input.buffer[g_input.cursor_position] = (char)ch;
+        g_input.cursor_position++;
+        g_input.length++;
         return true;
     }
 
-    return false; /* Unrecognised key – no change. */
+    return false;
 }
 
 /* ── Login screen ───────────────────────────────────────────────────────── */
 
-/**
- * show_login_labels – Draws the static "Username:" / "Password:" labels.
- *
- * Called once on entry and whenever the screen needs a full repaint.
- * Field contents are rendered separately via redraw_field().
- */
 static void show_login_labels(void)
 {
     mvprintw(USERNAME_ROW, LABEL_COL, "Username: ");
     mvprintw(PASSWORD_ROW, LABEL_COL, "Password: ");
 }
 
+/* ── Explorer screen ────────────────────────────────────────────────────── */
+
+static void show_explorer_header(char *ip_address, char *uname, char *current_directory,
+                                 int page, int max_page, char *debug_message)
+{
+    int width = getmaxx(stdscr);
+
+    move(0, 0);
+    for (int i = 0; i < width; ++i) { addch(' '); addch('-'); }
+
+    char *header_text = malloc(width + 1);
+    snprintf(header_text, width + 1, " Connected to: %s || Username: %s ", ip_address, uname);
+    int info_length = (int)strlen(header_text);
+    int padding     = (width - info_length) / 2;
+
+    mvprintw(0, padding, "%s", header_text);
+
+    move(1, 0);
+    for (int i = 0; i < width; ++i) addch('=');
+
+    mvprintw(2, 0, "%s", current_directory);
+
+    snprintf(header_text, width + 1, "page %d/%d", page, max_page);
+    info_length = (int)strlen(header_text);
+    padding     = width - info_length;
+    mvprintw(2, padding, "%s", header_text);
+
+    move(3, 0);
+    for (int i = 0; i < width; ++i) addch('-');
+
+    if (DEBUG)
+        mvprintw(4, 0, "DEBUG: %s", debug_message);
+
+    free(header_text);
+}
+
+static void show_explorer_footer(void)
+{
+    int width = getmaxx(stdscr);
+
+    move(getmaxy(stdscr) - 2, 0);
+    for (int i = 0; i < width; ++i) addch('-');
+
+    // TODO: Implement Refresh and Move, and Pagination, and everything except Esc to Quit.
+    mvprintw(getmaxy(stdscr) - 1, 0, "Commands: [Esc] Quit | [R] Refresh | [Up/Down] Navigate");
+}
+
 /* ── Application state ──────────────────────────────────────────────────── */
 
-typedef enum
-{
-    STATE_LOGIN,
-    STATE_EXPLORER
-} AppState;
+typedef enum { STATE_LOGIN, STATE_EXPLORER } AppState;
 
 /* ── Entry point ────────────────────────────────────────────────────────── */
 
 int main(void)
 {
     initscr();
-    noecho();            /* Don't echo keystrokes – we render them ourselves. */
-    cbreak();            /* Deliver keys immediately, without line buffering.  */
-    nodelay(stdscr, FALSE); /* Block in getch() until a key arrives.          */
-    keypad(stdscr, TRUE);   /* Enable arrow-key translation.                  */
-
-    static struct input_state username_state = {
-        .buffer          = {0},
-        .length          = 0,
-        .max_length      = INPUT_BUF_MAX,
-        .cursor_position = 0
-    };
-    static struct input_state password_state = {
-        .buffer          = {0},
-        .length          = 0,
-        .max_length      = INPUT_BUF_MAX,
-        .cursor_position = 0
-    };
+    noecho();
+    cbreak();
+    nodelay(stdscr, FALSE);
+    keypad(stdscr, TRUE);
 
     /* 0 = username field active, 1 = password field active. */
-    int active_field = 0;
-
-    AppState app_state = STATE_LOGIN;
-
-    /* Force a full redraw on the very first iteration. */
-    bool needs_full_redraw = true;
+    int      active_field     = 0;
+    AppState app_state        = STATE_LOGIN;
+    bool     needs_full_redraw = true;
+    char     debug_message[256] = {0};
+    debug_message[0] = '\0';
+    char *listing = NULL;
 
     while (1)
     {
@@ -222,27 +255,66 @@ int main(void)
                 clear();
                 show_login_labels();
 
-                /* Repaint both fields so nothing is lost after a clear(). */
-                redraw_field(USERNAME_ROW, false, &username_state);
-                redraw_field(PASSWORD_ROW, true,  &password_state);
+                /*
+                 * The inactive field is shown from its stored plain string;
+                 * the active field is shown from g_input (live editing slot).
+                 * We temporarily swap g_input to render the inactive field,
+                 * then restore it — but it's simpler to just print the stored
+                 * strings directly for the inactive row.
+                 */
+                if (active_field == 0)
+                {
+                    /* username is live in g_input; password comes from stored string */
+                    redraw_field(USERNAME_ROW, false);
+
+                    /* Print stored password as stars without touching g_input */
+                    move(PASSWORD_ROW, INPUT_COL);
+                    clrtoeol();
+                    for (int i = 0; password[i]; i++) addch('*');
+                }
+                else
+                {
+                    /* password is live in g_input; username comes from stored string */
+                    move(USERNAME_ROW, INPUT_COL);
+                    clrtoeol();
+                    mvprintw(USERNAME_ROW, INPUT_COL, "%s", username);
+
+                    redraw_field(PASSWORD_ROW, true);
+                }
 
                 needs_full_redraw = false;
             }
 
-            /* Always position the cursor in the active field. */
+            /* Keep the hardware cursor in the active field. */
             if (active_field == 0)
-                move(USERNAME_ROW, INPUT_COL + username_state.cursor_position);
+                move(USERNAME_ROW, INPUT_COL + g_input.cursor_position);
             else
-                move(PASSWORD_ROW, INPUT_COL + password_state.cursor_position);
+                move(PASSWORD_ROW, INPUT_COL + g_input.cursor_position);
 
             wrefresh(stdscr);
+        }
+        else if (app_state == STATE_EXPLORER)
+        {
+            if (needs_full_redraw)
+            {
+                clear();
+                show_explorer_header(SERVER_ADDRESS, username, "~", 1, 1, debug_message);
+                show_explorer_footer();
+                wrefresh(stdscr);
+                needs_full_redraw = false;
+            }
         }
 
         /* ── Input ──────────────────────────────────────────────────────── */
         int ch = getch();
 
-        if (ch == 27) /* Escape – quit. */
-            break;
+        if (ch == 27) break; /* Escape – quit. */
+
+        if (ch == KEY_RESIZE)
+        {
+            needs_full_redraw = true;
+            continue;
+        }
 
         if (app_state == STATE_LOGIN)
         {
@@ -250,57 +322,57 @@ int main(void)
             {
                 if (ch == '\n')
                 {
-                    /* Advance to the password field. */
+                    flush_input_to(username); /* Save username, clear slot. */
                     active_field      = 1;
                     needs_full_redraw = true;
+                    /* Load any previously typed password back for editing. */
+                    load_input_from(password);
                 }
-                else if (handle_input(ch, &username_state))
+                else if (handle_input(ch))
                 {
-                    redraw_field(USERNAME_ROW, false, &username_state);
+                    redraw_field(USERNAME_ROW, false);
                 }
             }
             else /* active_field == 1 */
             {
                 if (ch == '\n')
                 {
-                    /*
-                     * Attempt login: ask the server for the root directory
-                     * listing using the supplied credentials.
-                     */
-                    char *listing = list_directory(
+                    flush_input_to(password); /* Save password, clear slot. */
+
+                    listing = list_directory(
                         SERVER_ADDRESS, SERVER_PORT,
-                        username_state.buffer,
-                        password_state.buffer,
-                        "~"); /* List the user's home directory. */
+                        username, password, "~");
+
+                    debug_message[0] = '\0';
+                    if (listing)
+                    {
+                        strncat(debug_message, listing, sizeof(debug_message) - 1);
+                    }
 
                     if (listing != NULL)
                     {
-                        /* TODO: transition to STATE_EXPLORER and display
-                         * `listing` there.  For now, print it inline. */
                         clear();
                         mvprintw(0, 0, "Directory listing:\n%s", listing);
                         free(listing);
                         wrefresh(stdscr);
-
-                        app_state = STATE_EXPLORER;
+                        app_state         = STATE_EXPLORER;
+                        needs_full_redraw = true;
                     }
                     else
                     {
-                        /*
-                         * Login failed – show a brief error and let the
-                         * user try again without losing what they typed.
-                         */
                         mvprintw(PASSWORD_ROW + 1, LABEL_COL,
                                  "Login failed. Press any key to retry.");
                         wrefresh(stdscr);
-                        getch(); /* Wait for acknowledgement. */
+                        getch();
 
+                        /* Reload password into g_input so the user can edit it. */
+                        load_input_from(password);
                         needs_full_redraw = true;
                     }
                 }
-                else if (handle_input(ch, &password_state))
+                else if (handle_input(ch))
                 {
-                    redraw_field(PASSWORD_ROW, true, &password_state);
+                    redraw_field(PASSWORD_ROW, true);
                 }
             }
         }
