@@ -6,8 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 
-/* ── DEBUG ────────────────────────────────────────────────────── */
+/* ── DEBUG ─────────────────────────────────────────────────────────────── */
 #define DEBUG 0
 
 /* ── Network target ────────────────────────────────────────────────────── */
@@ -187,7 +188,7 @@ static const Sprite *get_sprite(enum SPRITES id)
     return &SPRITE_TABLE[id];
 }
 
-static void draw_sprite(int row, int col, enum SPRITES id)
+static void draw_sprite(int row, int col, enum SPRITES id, const char *filename)
 {
     const Sprite *sprite = get_sprite(id);
     if (!sprite)
@@ -195,9 +196,28 @@ static void draw_sprite(int row, int col, enum SPRITES id)
 
     for (int i = 0; i < SPRITE_HEIGHT; i++)
         mvaddstr(row + i, col, sprite->rows[i]);
+
+    /* For CODE_FILE, overlay the actual file extension */
+    if (id == CODE_FILE && filename)
+    {
+        const char *ext = strrchr(filename, '.');
+        if (ext && ext != filename)
+        {
+            ext++; /* Skip the dot */
+            char ext_display[4] = {0};
+            strncpy(ext_display, ext, 3);
+
+            /* Convert to lowercase for display */
+            for (int i = 0; ext_display[i]; i++)
+                ext_display[i] = tolower((unsigned char)ext_display[i]);
+
+            /* Draw at row+2 (where "py" is), col+2 (where "py" starts) */
+            mvprintw(row + 2, col + 2, "%-3s", ext_display);
+        }
+    }
 }
 
-static enum SPRITES classify_sprite(const char *name)
+static enum SPRITES classify_sprite(const char *name, int is_dir)
 {
     const char *ext;
 
@@ -209,6 +229,9 @@ static enum SPRITES classify_sprite(const char *name)
 
     if (strcmp(name, ".") == 0)
         return MOVE_UP;
+
+    if (is_dir)
+        return FOLDER;
 
     ext = strrchr(name, '.');
     if (!ext || ext == name)
@@ -271,14 +294,16 @@ static enum SPRITES classify_sprite(const char *name)
     return GENERIC_FILE;
 }
 
-static int parse_listing_entries(const char *listing, char ***entries_out)
+static int parse_listing_entries(const char *listing, char ***entries_out, int **types_out)
 {
     char  *copy;
     char  *tok;
     char **entries = NULL;
-    int    count = 0;
+    int   *types   = NULL;
+    int    count   = 0;
 
     *entries_out = NULL;
+    *types_out   = NULL;
     if (!listing || !listing[0])
         return 0;
 
@@ -289,29 +314,41 @@ static int parse_listing_entries(const char *listing, char ***entries_out)
     tok = strtok(copy, "\n");
     while (tok)
     {
-        char **tmp = realloc(entries, (size_t)(count + 1) * sizeof(*entries));
-        if (!tmp)
+        char **etmp = realloc(entries, (size_t)(count + 1) * sizeof(*entries));
+        int   *ttmp = realloc(types,   (size_t)(count + 1) * sizeof(*types));
+        if (!etmp || !ttmp)
             break;
 
-        entries = tmp;
-        entries[count] = strdup(tok);
+        entries = etmp;
+        types   = ttmp;
+
+        /* Strip the "d:" / "f:" prefix written by list_directory_sock(). */
+        int is_dir = 0;
+        const char *name = tok;
+        if (tok[0] == 'd' && tok[1] == ':') { is_dir = 1; name = tok + 2; }
+        else if (tok[0] == 'f' && tok[1] == ':') {          name = tok + 2; }
+
+        entries[count] = strdup(name);
         if (!entries[count])
             break;
 
+        types[count] = is_dir;
         count++;
         tok = strtok(NULL, "\n");
     }
 
     free(copy);
     *entries_out = entries;
+    *types_out   = types;
     return count;
 }
 
-static void free_listing_entries(char **entries, int count)
+static void free_listing_entries(char **entries, int *types, int count)
 {
     for (int i = 0; i < count; i++)
         free(entries[i]);
     free(entries);
+    free(types);
 }
 
 /* ── Stored credential strings (plain buffers, not input_states) ─────────── */
@@ -477,56 +514,133 @@ static void show_explorer_header(char *ip_address, char *uname, char *current_di
 
 
 
+/*
+ * Special sentinel names used for the synthetic MOVE_UP, NEW_FOLDER and
+ * NEW_FILE slots that are injected around the real directory entries.
+ * classify_sprite() already handles ".." → MOVE_UP; we add two more.
+ */
+#define SENTINEL_NEW_FOLDER "[ new folder ]"
+#define SENTINEL_NEW_FILE   "[ new file ]"
+
+/*
+ * entry_type values used internally in show_explorer_listing.
+ * Mirrors the LIST_TYPE_* wire constants but adds sentinel types.
+ */
+#define ETYPE_DIR        1
+#define ETYPE_FILE       0
+#define ETYPE_MOVE_UP   -1
+#define ETYPE_NEW_FOLDER -2
+#define ETYPE_NEW_FILE   -3
+
 static int show_explorer_listing(char *listing, int *current_page_zero_based)
 {
-    char **entries = NULL;
-    int count = parse_listing_entries(listing, &entries);
+    /* ── Parse the raw listing from the server ───────────────────────── */
+    char **raw_entries = NULL;
+    int   *raw_types   = NULL;
+    int    raw_count   = parse_listing_entries(listing, &raw_entries, &raw_types);
 
-    int width = getmaxx(stdscr);
-    int height = getmaxy(stdscr);
-    int available_width = width - 2;
+    /* ── Separate into dirs and files, sort each group alphabetically ── */
+    /* Worst case: raw_count dirs + raw_count files */
+    char **dirs      = malloc((size_t)raw_count * sizeof(*dirs));
+    char **files     = malloc((size_t)raw_count * sizeof(*files));
+    int    dir_count = 0, file_count = 0;
+
+    for (int i = 0; i < raw_count; i++)
+    {
+        if (raw_types && raw_types[i] == ETYPE_DIR)
+            dirs[dir_count++]   = raw_entries[i];
+        else
+            files[file_count++] = raw_entries[i];
+    }
+
+    /* Simple insertion sort (directories and files are typically small lists). */
+    for (int i = 1; i < dir_count; i++) {
+        char *key = dirs[i];
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(dirs[j], key) > 0) { dirs[j+1] = dirs[j]; j--; }
+        dirs[j+1] = key;
+    }
+    for (int i = 1; i < file_count; i++) {
+        char *key = files[i];
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(files[j], key) > 0) { files[j+1] = files[j]; j--; }
+        files[j+1] = key;
+    }
+
+    /*
+     * ── Build the final display array ───────────────────────────────────
+     *
+     * Layout:
+     *   [0]              MOVE_UP       ".."
+     *   [1 .. dir_count] DIR           real directories
+     *   [dir_count+1]    NEW_FOLDER    sentinel
+     *   [dir_count+2 ..] FILE          real files
+     *   [last]           NEW_FILE      sentinel
+     */
+    int total = 1 + dir_count + 1 + file_count + 1;  /* up + dirs + new_folder + files + new_file */
+
+    char **entries = malloc((size_t)total * sizeof(*entries));
+    int   *etypes  = malloc((size_t)total * sizeof(*etypes));
+
+    int idx = 0;
+    entries[idx] = "..";               etypes[idx] = ETYPE_MOVE_UP;    idx++;
+    for (int i = 0; i < dir_count;  i++) { entries[idx] = dirs[i];  etypes[idx] = ETYPE_DIR;        idx++; }
+    entries[idx] = SENTINEL_NEW_FOLDER; etypes[idx] = ETYPE_NEW_FOLDER; idx++;
+    for (int i = 0; i < file_count; i++) { entries[idx] = files[i]; etypes[idx] = ETYPE_FILE;       idx++; }
+    entries[idx] = SENTINEL_NEW_FILE;   etypes[idx] = ETYPE_NEW_FILE;   idx++;
+
+    free(dirs);
+    free(files);
+
+    /* ── Layout maths ────────────────────────────────────────────────── */
+    int width            = getmaxx(stdscr);
+    int height           = getmaxy(stdscr);
+    int available_width  = width - 2;
     int available_height = (height - 2) - LIST_TOP_ROW;
-    int cols = available_width / TILE_WIDTH;
-    int rows = available_height / TILE_HEIGHT;
-    int per_page;
-    int page_count;
-    int page;
-    int start;
+    int cols             = available_width  / TILE_WIDTH;
+    int rows             = available_height / TILE_HEIGHT;
 
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
 
-    per_page = cols * rows;
-    page_count = (count <= 0) ? 1 : ((count + per_page - 1) / per_page);
+    int per_page   = cols * rows;
+    int page_count = (total + per_page - 1) / per_page;
 
-    page = *current_page_zero_based;
-    if (page < 0) page = 0;
+    int page = *current_page_zero_based;
+    if (page < 0)          page = 0;
     if (page >= page_count) page = page_count - 1;
     *current_page_zero_based = page;
 
-    if (count == 0)
-    {
-        mvprintw(LIST_TOP_ROW, 2, "No items in this directory.");
-        free_listing_entries(entries, count);
-        return page_count;
-    }
-
-    start = page * per_page;
-    for (int i = 0; i < per_page && (start + i) < count; i++)
+    /* ── Draw ────────────────────────────────────────────────────────── */
+    int start = page * per_page;
+    for (int i = 0; i < per_page && (start + i) < total; i++)
     {
         int grid_row = i / cols;
         int grid_col = i % cols;
         int draw_row = LIST_TOP_ROW + (grid_row * TILE_HEIGHT);
         int draw_col = 2 + (grid_col * TILE_WIDTH);
-        enum SPRITES sprite = classify_sprite(entries[start + i]);
 
-        draw_sprite(draw_row, draw_col, sprite);
-        mvprintw(draw_row + SPRITE_HEIGHT, draw_col, "%-20.20s", entries[start + i]);
+        enum SPRITES sprite;
+        const char  *label = entries[start + i];
+
+        switch (etypes[start + i])
+        {
+            case ETYPE_MOVE_UP:    sprite = MOVE_UP;    label = "..";           break;
+            case ETYPE_DIR:        sprite = FOLDER;     break;
+            case ETYPE_NEW_FOLDER: sprite = NEW_FOLDER; label = "New Folder";   break;
+            case ETYPE_FILE:       sprite = classify_sprite(label, 0);          break;
+            case ETYPE_NEW_FILE:   sprite = NEW_FILE;   label = "New File";     break;
+            default:               sprite = GENERIC_FILE; break;
+        }
+
+        draw_sprite(draw_row, draw_col, sprite, entries[start + i]);
+        mvprintw(draw_row + SPRITE_HEIGHT, draw_col, "%-20.20s", label);
     }
 
-    free_listing_entries(entries, count);
+    free(entries);
+    free(etypes);
+    free_listing_entries(raw_entries, raw_types, raw_count);
     return page_count;
-
 }
 
 static void show_explorer_footer(void)

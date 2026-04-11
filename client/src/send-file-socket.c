@@ -566,15 +566,28 @@ int upload_file(sock_t sock, const char *filepath, const char *target_path)
 
 /* ── Directory listing ───────────────────────────────────────────────────── */
 
+/*
+ * Type byte values sent by the server for each directory entry.
+ * Kept in sync with the LIST_TYPE_* constants in session.c.
+ */
+#define LIST_TYPE_EOL  0x00   /* End-of-list marker (no length/name follows) */
+#define LIST_TYPE_FILE 0x01   /* Regular file (or unknown)                   */
+#define LIST_TYPE_DIR  0x02   /* Directory                                   */
+
 /**
  * list_directory_sock - Retrieve a directory listing from the server.
  *
  * Wire format received:
  *   [1 byte status: 0x00 = OK]
  *   Repeated until end-of-list:
+ *     [1 byte type: LIST_TYPE_FILE (0x01) or LIST_TYPE_DIR (0x02)]
  *     [4 bytes big-endian entry length]
  *     [entry bytes]
- *   End-of-list marker: [4 bytes = 0x00000000]
+ *   End-of-list marker: [1 byte: LIST_TYPE_EOL (0x00)]
+ *
+ * Each line in the returned string is prefixed with the type:
+ *   "d:<name>\n"  for directories
+ *   "f:<name>\n"  for files
  *
  * @param sock         Connected socket, positioned after the mode byte.
  * @param remote_path  Directory path on the server to list.
@@ -603,6 +616,23 @@ char *list_directory_sock(sock_t sock, const char *remote_path)
 	char entry[MAX_PATH_LEN + 1];
 
 	while (1) {
+		/* Read the type byte first. */
+		unsigned char type_byte;
+		if (recv_exact(sock, &type_byte, 1) != 0) {
+			free(result);
+			return NULL;
+		}
+
+		if (type_byte == LIST_TYPE_EOL)
+			break;   /* End-of-list marker */
+
+		if (type_byte != LIST_TYPE_FILE && type_byte != LIST_TYPE_DIR) {
+			fprintf(stderr, "list_directory_sock: unknown type byte 0x%02x\n", type_byte);
+			free(result);
+			return NULL;
+		}
+
+		/* Read the 4-byte length. */
 		unsigned char len_buf[4];
 		if (recv_exact(sock, len_buf, 4) != 0) {
 			free(result);
@@ -610,10 +640,7 @@ char *list_directory_sock(sock_t sock, const char *remote_path)
 		}
 		uint32_t entry_len = be_to_uint32(len_buf);
 
-		if (entry_len == 0)
-			break;   /* End-of-list marker */
-
-		if (entry_len > MAX_PATH_LEN) {
+		if (entry_len == 0 || entry_len > MAX_PATH_LEN) {
 			fprintf(stderr, "list_directory_sock: invalid entry length %u\n", entry_len);
 			free(result);
 			return NULL;
@@ -625,8 +652,12 @@ char *list_directory_sock(sock_t sock, const char *remote_path)
 		}
 		entry[entry_len] = '\0';
 
-		/* Grow buffer if needed: +1 for newline, +1 for NUL. */
-		size_t needed = buf_used + entry_len + 2;
+		/* Build the prefixed line: "d:<name>" or "f:<name>". */
+		const char *prefix = (type_byte == LIST_TYPE_DIR) ? "d:" : "f:";
+		size_t      prefix_len = 2;
+
+		/* Grow buffer if needed: prefix(2) + name + newline + NUL. */
+		size_t needed = buf_used + prefix_len + entry_len + 2;
 		if (needed > buf_cap) {
 			buf_cap = needed * 2;
 			char *tmp = realloc(result, buf_cap);
@@ -640,6 +671,8 @@ char *list_directory_sock(sock_t sock, const char *remote_path)
 		if (buf_used > 0)
 			result[buf_used++] = '\n';
 
+		memcpy(result + buf_used, prefix, prefix_len);
+		buf_used += prefix_len;
 		memcpy(result + buf_used, entry, entry_len);
 		buf_used += entry_len;
 		result[buf_used] = '\0';
