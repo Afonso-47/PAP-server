@@ -12,7 +12,7 @@
 #define DEBUG 0
 
 /* ── Network target ────────────────────────────────────────────────────── */
-#define SERVER_ADDRESS "192.168.1.102"
+#define SERVER_ADDRESS "192.168.1.102" // 10.0.0.1
 #define SERVER_PORT    "9001"
 
 /* ── Layout constants ──────────────────────────────────────────────────── */
@@ -294,19 +294,37 @@ static enum SPRITES classify_sprite(const char *name, int is_dir)
     return GENERIC_FILE;
 }
 
+/**
+ * @brief Parse a newline-separated directory listing into parallel arrays.
+ *
+ * The wire format may prefix each line with `d:` (directory) or `f:` (file).
+ * This function strips that prefix, duplicates the visible name, and records
+ * the type in `types_out` (`1` for directory, `0` for file).
+ *
+ * @param listing      Raw listing buffer (lines separated by `\n`).
+ * @param entries_out  Output array of allocated entry-name strings.
+ * @param types_out    Output array of entry types aligned with `entries_out`.
+ * @return Number of parsed entries. May be a partial count on allocation
+ *         failure. Returns `0` for empty input or if parsing cannot start.
+ *
+ * @note Ownership of `*entries_out` and `*types_out` is transferred to the
+ *       caller and must be released with `free_listing_entries()`.
+ */
 static int parse_listing_entries(const char *listing, char ***entries_out, int **types_out)
 {
     char  *copy;
-    char  *tok;
+    char  *tok;             // strtok() cursor
     char **entries = NULL;
     int   *types   = NULL;
     int    count   = 0;
 
+    /* Always initialize outputs so callers can safely free on all paths. */
     *entries_out = NULL;
     *types_out   = NULL;
     if (!listing || !listing[0])
         return 0;
 
+    /* strtok() mutates its input, so parse a writable duplicate. */
     copy = strdup(listing);
     if (!copy)
         return 0;
@@ -314,8 +332,14 @@ static int parse_listing_entries(const char *listing, char ***entries_out, int *
     tok = strtok(copy, "\n");
     while (tok)
     {
+        /* Grow both parallel arrays by one slot for this entry. */
         char **etmp = realloc(entries, (size_t)(count + 1) * sizeof(*entries));
         int   *ttmp = realloc(types,   (size_t)(count + 1) * sizeof(*types));
+
+        /*
+         * On allocation failure, keep already parsed items and return a
+         * partial result. Callers receive ownership of accumulated arrays.
+         */
         if (!etmp || !ttmp)
             break;
 
@@ -328,6 +352,7 @@ static int parse_listing_entries(const char *listing, char ***entries_out, int *
         if (tok[0] == 'd' && tok[1] == ':') { is_dir = 1; name = tok + 2; }
         else if (tok[0] == 'f' && tok[1] == ':') {          name = tok + 2; }
 
+        /* Store an owned copy of the entry name (without the wire prefix). */
         entries[count] = strdup(name);
         if (!entries[count])
             break;
@@ -338,13 +363,23 @@ static int parse_listing_entries(const char *listing, char ***entries_out, int *
     }
 
     free(copy);
+
+    /* Transfer ownership of parsed arrays to the caller. */
     *entries_out = entries;
     *types_out   = types;
     return count;
 }
 
+/**
+ * @brief Free arrays produced by `parse_listing_entries()`.
+ *
+ * @param entries Array of allocated entry-name strings.
+ * @param types   Parallel type array associated with `entries`.
+ * @param count   Number of valid elements in both arrays.
+ */
 static void free_listing_entries(char **entries, int *types, int count)
 {
+    /* Free each name, then free the parallel containers. */
     for (int i = 0; i < count; i++)
         free(entries[i]);
     free(entries);
@@ -677,6 +712,7 @@ int main(void)
     char     debug_message[256] = {0};
     debug_message[0] = '\0';
     char *listing = NULL;
+    char *current_directory = "~";
     int explorer_page = 0;
     int explorer_max_pages = 1;
 
@@ -734,7 +770,7 @@ int main(void)
             {
                 clear();
                 explorer_max_pages = show_explorer_listing(listing, &explorer_page);
-                show_explorer_header(SERVER_ADDRESS, username, "~",
+                show_explorer_header(SERVER_ADDRESS, username, current_directory,
                                      explorer_page + 1, explorer_max_pages, debug_message);
                 show_explorer_footer();
                 wrefresh(stdscr);
@@ -778,7 +814,7 @@ int main(void)
 
                     listing = list_directory(
                         SERVER_ADDRESS, SERVER_PORT,
-                        username, password, "~");
+                        username, password, current_directory);
 
                     debug_message[0] = '\0';
                     if (listing)
@@ -833,7 +869,7 @@ int main(void)
             {
                 char *new_listing = list_directory(
                     SERVER_ADDRESS, SERVER_PORT,
-                    username, password, "~");
+                    username, password, current_directory);
 
                 if (new_listing)
                 {
