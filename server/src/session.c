@@ -1,888 +1,828 @@
-#include "./send-file-socket.c"
 
-#include <locale.h>
-#include <ncurses.h>
-#include <assert.h>
+/**
+ * @file session.c
+ * @brief Session handler for PAP server bidirectional file transfer
+ *
+ * This module implements authenticated file transfer sessions, supporting:
+ * - User authentication via username
+ * - Download mode (server → client)
+ * - Upload mode (client → server)
+ * - Directory listing mode
+ * - Tilde (~) path expansion using system user database
+ * - Automatic parent directory creation for uploads
+ * - Status byte error reporting (0x00=OK, 0x01=ERROR)
+ */
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1   /* Expose DT_DIR / DT_REG / d_type from <dirent.h> */
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <ctype.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <pwd.h>
+#include <wordexp.h>
+#include <dirent.h>
+#include <limits.h>
+#include <shadow.h>
 
-/* ── DEBUG ─────────────────────────────────────────────────────────────── */
-#define DEBUG 0
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
-/* ── Network target ────────────────────────────────────────────────────── */
-#define SERVER_ADDRESS "192.168.1.102" // 10.0.0.1
-#define SERVER_PORT    "9001"
+#include "session.h"
 
-/* ── Layout constants ──────────────────────────────────────────────────── */
-#define USERNAME_ROW   0
-#define PASSWORD_ROW   1
-#define LABEL_COL      0
-#define INPUT_COL      10   /* "Password: " is 10 chars wide */
+/* ========== Protocol Constants ========== */
+#define BUFFER_SIZE 4096          /**< Size of file transfer buffer */
+#define MODE_DOWNLOAD 'D'         /**< Download mode: server → client */
+#define MODE_UPLOAD   'U'         /**< Upload mode: client → server */
+#define MODE_LIST     'L'         /**< List mode: directory listing */
+#define STATUS_OK 0x00            /**< Status byte: operation succeeded */
+#define STATUS_ERROR 0x01         /**< Status byte: operation failed */
 
-/* ── Buffer sizes ──────────────────────────────────────────────────────── */
-#define INPUT_BUF_MAX  1024
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * struct input_state
+/**
+ * @brief Current authenticated username for tilde expansion
  *
- * A single, reusable input slot.  Only one field is "live" at a time;
- * when focus moves away, flush_input_to() copies the buffer into a plain
- * char[] and resets this struct for the next field.
+ * This global stores the username sent by the client during authentication.
+ * It is used by expand_tilde() to resolve ~ and ~user/ paths.
+ */
+static char current_username[256] = {0};
+
+/* ========== Low-Level Socket Helpers ========== */
+
+/**
+ * @brief Receive an exact number of bytes from a socket
  *
- *   buffer          – Null-terminated character array holding the typed text.
- *   length          – Number of characters currently in the buffer
- *                     (excludes the null terminator).
- *   max_length      – Hard capacity of `buffer`, including the null
- *                     terminator.  Characters are rejected once
- *                     length >= max_length - 1.
- *   cursor_position – Logical index within `buffer` at which the next
- *                     keystroke will be inserted (0 … length, inclusive).
- * ═══════════════════════════════════════════════════════════════════════════ */
-struct input_state
-{
-    char buffer[INPUT_BUF_MAX];
-    int  length;
-    int  max_length;
-    int  cursor_position;
-};
-
-/* ── Single global input slot ───────────────────────────────────────────── */
-static struct input_state g_input = {
-    .buffer          = {0},
-    .length          = 0,
-    .max_length      = INPUT_BUF_MAX,
-    .cursor_position = 0
-};
-
-
-enum SPRITES
-{
-    MOVE_UP,
-    FOLDER,
-    EMPTY_FOLDER,
-    NEW_FOLDER,
-    GENERIC_FILE,
-    TEXT_FILE,
-    BIN_FILE,
-    CODE_FILE,
-    HTML_FILE,
-    LINK_FILE,
-    VIDEO_FILE,
-    AUDIO_FILE,
-    IMAGE_FILE,
-    ZIP_FILE,
-    NEW_FILE,
-    SPRITE_COUNT
-};
-
-#define SPRITE_HEIGHT 4
-#define SPRITE_WIDTH  8
-#define TILE_WIDTH    24
-#define TILE_HEIGHT   6
-#define LIST_TOP_ROW  6
-
-typedef struct
-{
-    const char *rows[SPRITE_HEIGHT];
-} Sprite;
-
-static const Sprite SPRITE_TABLE[SPRITE_COUNT] =
-{
-    [MOVE_UP] = { .rows = {
-        "  .^.   ",
-        " /   \\  ",
-        "'─┐ ┌─' ",
-        "  └─┘   "
-    }},
-    [FOLDER] = { .rows = {
-        "┌──┐___.",
-        "│      │",
-        "│      │",
-        "└──────┘"
-    }},
-    [EMPTY_FOLDER] = { .rows = {
-        "┌──┐___.",
-        "│  └───┤",
-        "│      │",
-        "└──────┘"
-    }},
-    [NEW_FOLDER] = { .rows = {
-        "  ┌─┐   ",
-        "┌─┘ └─┐ ",
-        "└─┐ ┌─┘ ",
-        "  └─┘   "
-    }},
-    [GENERIC_FILE] = { .rows = {
-        "┌────.  ",
-        "│     \\ ",
-        "│     │ ",
-        "└─────┘ "
-    }},
-    [TEXT_FILE] = { .rows = {
-        "┌────.  ",
-        "│ --- \\ ",
-        "│ --- │ ",
-        "└─────┘ "
-    }},
-    [BIN_FILE] = { .rows = {
-        "┌────.  ",
-        "│ ... \\ ",
-        "│ ... │ ",
-        "└─────┘ "
-    }},
-    [CODE_FILE] = { .rows = {
-        "┌────.  ",
-        "│     \\ ",
-        "│ py  │ ",
-        "└─────┘ "
-    }},
-    [HTML_FILE] = { .rows = {
-        "┌────.  ",
-        "│     \\ ",
-        "│ </> │ ",
-        "└─────┘ "
-    }},
-    [LINK_FILE] = { .rows = {
-        "┌────.  ",
-        "│     \\ ",
-        "│ ./  │ ",
-        "└─────┘ "
-    }},
-    [VIDEO_FILE] = { .rows = {
-        "┌────.  ",
-        "│ |\\  \\ ",
-        "│ |/  │ ",
-        "└─────┘ "
-    }},
-    [AUDIO_FILE] = { .rows = {
-        "┌────.  ",
-        "│  ┌~ \\ ",
-        "│ O┘  │ ",
-        "└─────┘ "
-    }},
-    [IMAGE_FILE] = { .rows = {
-        "┌────.  ",
-        "│ /\\ o\\ ",
-        "│/  \\/│ ",
-        "└─────┘ "
-    }},
-    [ZIP_FILE] = { .rows = {
-        "┌────.  ",
-        "│.  ┴ \\ ",
-        "│.  ┴ │ ",
-        "└───┴─┘ "
-    }},
-    [NEW_FILE] = { .rows = {
-        "  ┌─┐   ",
-        "┌─┘ └─┐ ",
-        "└─┐ ┌─┘ ",
-        "  └─┘   "
-    }},
-};
-
-static const Sprite *get_sprite(enum SPRITES id)
-{
-    if (id < 0 || id >= SPRITE_COUNT) return NULL;
-    return &SPRITE_TABLE[id];
-}
-
-static void draw_sprite(int row, int col, enum SPRITES id, const char *filename)
-{
-    const Sprite *sprite = get_sprite(id);
-    if (!sprite)
-        return;
-
-    for (int i = 0; i < SPRITE_HEIGHT; i++)
-        mvaddstr(row + i, col, sprite->rows[i]);
-
-    /* For CODE_FILE, overlay the actual file extension */
-    if (id == CODE_FILE && filename)
-    {
-        const char *ext = strrchr(filename, '.');
-        if (ext && ext != filename)
-        {
-            ext++; /* Skip the dot */
-            char ext_display[4] = {0};
-            strncpy(ext_display, ext, 3);
-
-            /* Convert to lowercase for display */
-            for (int i = 0; ext_display[i]; i++)
-                ext_display[i] = tolower((unsigned char)ext_display[i]);
-
-            /* Draw at row+2 (where "py" is), col+2 (where "py" starts) */
-            mvprintw(row + 2, col + 2, "%-3s", ext_display);
-        }
+ * This function loops until exactly 'len' bytes have been received,
+ * handling partial reads that can occur with TCP sockets.
+ *
+ * @param fd Socket file descriptor
+ * @param buf Buffer to store received data
+ * @param len Number of bytes to receive
+ * @return Total bytes received (should equal len), or <= 0 on error/disconnect
+ */
+static int recv_exact(int fd, void *buf, size_t len) {
+    size_t total = 0;
+    char *p = (char *)buf;
+    while (total < len) {
+        int n = recv(fd, p + total, len - total, 0);
+        if (n <= 0) return n;  // Error or connection closed
+        total += n;
     }
-}
-
-static enum SPRITES classify_sprite(const char *name, int is_dir)
-{
-    const char *ext;
-
-    if (!name || !name[0])
-        return GENERIC_FILE;
-
-    if (strcmp(name, "..") == 0)
-        return MOVE_UP;
-
-    if (strcmp(name, ".") == 0)
-        return MOVE_UP;
-
-    if (is_dir)
-        return FOLDER;
-
-    ext = strrchr(name, '.');
-    if (!ext || ext == name)
-        return GENERIC_FILE;
-
-    if (strcasecmp(ext, ".txt") == 0 ||
-        strcasecmp(ext, ".md") == 0 ||
-        strcasecmp(ext, ".log") == 0)
-        return TEXT_FILE;
-
-    if (strcasecmp(ext, ".c") == 0 ||
-        strcasecmp(ext, ".h") == 0 ||
-        strcasecmp(ext, ".cpp") == 0 ||
-        strcasecmp(ext, ".hpp") == 0 ||
-        strcasecmp(ext, ".py") == 0 ||
-        strcasecmp(ext, ".js") == 0 ||
-        strcasecmp(ext, ".ts") == 0 ||
-        strcasecmp(ext, ".java") == 0)
-        return CODE_FILE;
-
-    if (strcasecmp(ext, ".html") == 0 ||
-        strcasecmp(ext, ".htm") == 0)
-        return HTML_FILE;
-
-    if (strcasecmp(ext, ".zip") == 0 ||
-        strcasecmp(ext, ".tar") == 0 ||
-        strcasecmp(ext, ".gz") == 0 ||
-        strcasecmp(ext, ".7z") == 0 ||
-        strcasecmp(ext, ".rar") == 0)
-        return ZIP_FILE;
-
-    if (strcasecmp(ext, ".png") == 0 ||
-        strcasecmp(ext, ".jpg") == 0 ||
-        strcasecmp(ext, ".jpeg") == 0 ||
-        strcasecmp(ext, ".gif") == 0 ||
-        strcasecmp(ext, ".webp") == 0 ||
-        strcasecmp(ext, ".svg") == 0)
-        return IMAGE_FILE;
-
-    if (strcasecmp(ext, ".mp4") == 0 ||
-        strcasecmp(ext, ".mkv") == 0 ||
-        strcasecmp(ext, ".avi") == 0 ||
-        strcasecmp(ext, ".mov") == 0)
-        return VIDEO_FILE;
-
-    if (strcasecmp(ext, ".mp3") == 0 ||
-        strcasecmp(ext, ".wav") == 0 ||
-        strcasecmp(ext, ".ogg") == 0 ||
-        strcasecmp(ext, ".flac") == 0)
-        return AUDIO_FILE;
-
-    if (strcasecmp(ext, ".lnk") == 0 ||
-        strcasecmp(ext, ".url") == 0)
-        return LINK_FILE;
-
-    if (strcasecmp(ext, ".bin") == 0 ||
-        strcasecmp(ext, ".dat") == 0)
-        return BIN_FILE;
-
-    return GENERIC_FILE;
+    return (int)total;
 }
 
 /**
- * @brief Parse a newline-separated directory listing into parallel arrays.
+ * @brief Receive a length-prefixed string (path/username) from socket
  *
- * The wire format may prefix each line with `d:` (directory) or `f:` (file).
- * This function strips that prefix, duplicates the visible name, and records
- * the type in `types_out` (`1` for directory, `0` for file).
+ * Protocol format:
+ * - 4 bytes: big-endian uint32_t length
+ * - N bytes: UTF-8 string data (not null-terminated on wire)
  *
- * @param listing      Raw listing buffer (lines separated by `\n`).
- * @param entries_out  Output array of allocated entry-name strings.
- * @param types_out    Output array of entry types aligned with `entries_out`.
- * @return Number of parsed entries. May be a partial count on allocation
- *         failure. Returns `0` for empty input or if parsing cannot start.
- *
- * @note Ownership of `*entries_out` and `*types_out` is transferred to the
- *       caller and must be released with `free_listing_entries()`.
+ * @param fd Socket file descriptor
+ * @return Malloc'd null-terminated string, or NULL on error
+ * @note Caller must free() the returned string
+ * @note Rejects lengths > 4096 to prevent memory exhaustion attacks
  */
-static int parse_listing_entries(const char *listing, char ***entries_out, int **types_out)
-{
-    char  *copy;
-    char  *tok;             // strtok() cursor
-    char **entries = NULL;
-    int   *types   = NULL;
-    int    count   = 0;
+static char *recv_path_alloc(int fd) {
+    uint32_t len_be;
+    int n = recv_exact(fd, &len_be, sizeof(len_be));
+    if (n <= 0) return NULL;
 
-    /* Always initialize outputs so callers can safely free on all paths. */
-    *entries_out = NULL;
-    *types_out   = NULL;
-    if (!listing || !listing[0])
-        return 0;
+    // Convert from network byte order (big-endian) to host byte order
+    uint32_t len = ntohl(len_be);
+    if (len == 0 || len > 4096) return NULL;  // Sanity check
 
-    /* strtok() mutates its input, so parse a writable duplicate. */
-    copy = strdup(listing);
-    if (!copy)
-        return 0;
+    char *path = malloc(len + 1);  // +1 for null terminator
+    if (!path) return NULL;
 
-    tok = strtok(copy, "\n");
-    while (tok)
-    {
-        /* Grow both parallel arrays by one slot for this entry. */
-        char **etmp = realloc(entries, (size_t)(count + 1) * sizeof(*entries));
-        int   *ttmp = realloc(types,   (size_t)(count + 1) * sizeof(*types));
-
-        /*
-         * On allocation failure, keep already parsed items and return a
-         * partial result. Callers receive ownership of accumulated arrays.
-         */
-        if (!etmp || !ttmp)
-            break;
-
-        entries = etmp;
-        types   = ttmp;
-
-        /* Strip the "d:" / "f:" prefix written by list_directory_sock(). */
-        int is_dir = 0;
-        const char *name = tok;
-        if (tok[0] == 'd' && tok[1] == ':') { is_dir = 1; name = tok + 2; }
-        else if (tok[0] == 'f' && tok[1] == ':') {          name = tok + 2; }
-
-        /* Store an owned copy of the entry name (without the wire prefix). */
-        entries[count] = strdup(name);
-        if (!entries[count])
-            break;
-
-        types[count] = is_dir;
-        count++;
-        tok = strtok(NULL, "\n");
-    }
-
-    free(copy);
-
-    /* Transfer ownership of parsed arrays to the caller. */
-    *entries_out = entries;
-    *types_out   = types;
-    return count;
+    n = recv_exact(fd, path, len);
+    if (n <= 0) { free(path); return NULL; }
+    path[len] = '\0';  // Add null terminator
+    return path;
 }
 
 /**
- * @brief Free arrays produced by `parse_listing_entries()`.
+ * @brief Send an exact number of bytes to a socket
  *
- * @param entries Array of allocated entry-name strings.
- * @param types   Parallel type array associated with `entries`.
- * @param count   Number of valid elements in both arrays.
- */
-static void free_listing_entries(char **entries, int *types, int count)
-{
-    /* Free each name, then free the parallel containers. */
-    for (int i = 0; i < count; i++)
-        free(entries[i]);
-    free(entries);
-    free(types);
-}
-
-/* ── Stored credential strings (plain buffers, not input_states) ─────────── */
-static char username[INPUT_BUF_MAX] = {0};
-static char password[INPUT_BUF_MAX] = {0};
-
-/* ── Helpers ────────────────────────────────────────────────────────────── */
-
-/**
- * flush_input_to – Copies g_input.buffer into `dest` then resets g_input.
+ * This function loops until exactly 'len' bytes have been sent,
+ * handling partial writes that can occur with TCP sockets.
  *
- * Call this whenever focus leaves a field so that the typed value is
- * preserved in a plain string while the shared slot is ready for the
- * next field.
+ * @param fd Socket file descriptor
+ * @param buf Buffer containing data to send
+ * @param len Number of bytes to send
+ * @return Total bytes sent (should equal len), or <= 0 on error
  */
-static void flush_input_to(char *dest)
-{
-    memcpy(dest, g_input.buffer, (size_t)(g_input.length + 1)); /* +1 for '\0' */
-    memset(&g_input, 0, sizeof g_input);
-    g_input.max_length = INPUT_BUF_MAX;
+static int send_all(int fd, const void *buf, size_t len) {
+    size_t total = 0;
+    const char *p = (const char *)buf;
+    while (total < len) {
+        int n = send(fd, p + total, len - total, 0);
+        if (n <= 0) return n;  // Error or connection closed
+        total += n;
+    }
+    return (int)total;
 }
 
 /**
- * load_input_from – Loads a previously stored string back into g_input.
- *
- * Call this when returning focus to a field that was already filled in,
- * so the user can continue editing where they left off.
+ * @brief Send a length-prefixed string to socket (4-byte BE length + bytes)
  */
-static void load_input_from(const char *src)
-{
-    int len = (int)strlen(src);
-    memcpy(g_input.buffer, src, (size_t)(len + 1));
-    g_input.length          = len;
-    g_input.cursor_position = len;   /* Place cursor at the end. */
-    g_input.max_length      = INPUT_BUF_MAX;
-}
-
-/**
- * redraw_field – Repaints a single input field in place.
- *
- * Moves to (row, INPUT_COL), clears to end-of-line, then reprints every
- * character in g_input (or '*' when hide_input is true).  Finally
- * positions the screen cursor at the logical cursor_position.
- */
-static void redraw_field(int row, bool hide_input)
-{
-    move(row, INPUT_COL);
-    clrtoeol();
-
-    for (int i = 0; i < g_input.length; i++)
-        addch(hide_input ? '*' : (unsigned char)g_input.buffer[i]);
-
-    move(row, INPUT_COL + g_input.cursor_position);
-}
-
-/**
- * handle_input – Applies one keypress to g_input.
- *
- * Does NOT touch the screen; the caller is responsible for calling
- * redraw_field() afterwards so the display stays consistent with the
- * buffer.
- *
- * Supported keys:
- *   KEY_BACKSPACE / 127  – delete the character to the left of the cursor.
- *   KEY_LEFT             – move cursor one step left (clamped at 0).
- *   KEY_RIGHT            – move cursor one step right (clamped at length).
- *   32–126 (printable)   – insert character at cursor, shifting right.
- *   All other values     – silently ignored.
- *
- * Returns true if the buffer was modified (so the caller can decide
- * whether a redraw is necessary).
- */
-static bool handle_input(int ch)
-{
-    if (ch == KEY_BACKSPACE || ch == 127)
-    {
-        if (g_input.cursor_position == 0)
-            return false;
-
-        int del = g_input.cursor_position - 1;
-        memmove(&g_input.buffer[del],
-                &g_input.buffer[del + 1],
-                (size_t)(g_input.length - del)); /* includes '\0' */
-
-        g_input.cursor_position--;
-        g_input.length--;
-        return true;
-    }
-
-    if (ch == KEY_LEFT)
-    {
-        if (g_input.cursor_position > 0) { g_input.cursor_position--; return true; }
-        return false;
-    }
-
-    if (ch == KEY_RIGHT)
-    {
-        if (g_input.cursor_position < g_input.length) { g_input.cursor_position++; return true; }
-        return false;
-    }
-
-    if ((ch >= 32 && ch < 127) || (ch >= 128 && ch <= 255))
-    {
-        if (g_input.length >= g_input.max_length - 1)
-            return false;
-
-        memmove(&g_input.buffer[g_input.cursor_position + 1],
-                &g_input.buffer[g_input.cursor_position],
-                (size_t)(g_input.length - g_input.cursor_position + 1));
-
-        g_input.buffer[g_input.cursor_position] = (char)ch;
-        g_input.cursor_position++;
-        g_input.length++;
-        return true;
-    }
-
-    return false;
-}
-
-/* ── Login screen ───────────────────────────────────────────────────────── */
-
-static void show_login_labels(void)
-{
-    mvprintw(USERNAME_ROW, LABEL_COL, "Username: ");
-    mvprintw(PASSWORD_ROW, LABEL_COL, "Password: ");
-}
-
-/* ── Explorer screen ────────────────────────────────────────────────────── */
-
-static void show_explorer_header(char *ip_address, char *uname, char *current_directory,
-                                 int page, int max_page, char *debug_message)
-{
-    int width = getmaxx(stdscr);
-
-    move(0, 0);
-    for (int i = 0; i < width; ++i) { addch(' '); addch('-'); }
-
-    char *header_text = malloc(width + 1);
-    snprintf(header_text, width + 1, " Connected to: %s || Username: %s ", ip_address, uname);
-    int info_length = (int)strlen(header_text);
-    int padding     = (width - info_length) / 2;
-
-    mvprintw(0, padding, "%s", header_text);
-
-    move(1, 0);
-    for (int i = 0; i < width; ++i) addch('=');
-
-    mvprintw(2, 0, "%s", current_directory);
-
-    snprintf(header_text, width + 1, "page %d/%d", page, max_page);
-    info_length = (int)strlen(header_text);
-    padding     = width - info_length;
-    mvprintw(2, padding, "%s", header_text);
-
-    move(3, 0);
-    for (int i = 0; i < width; ++i) addch('-');
-
-    if (DEBUG)
-        mvprintw(4, 0, "DEBUG: %s", debug_message);
-
-    free(header_text);
-}
-
-
-
-/*
- * Special sentinel names used for the synthetic MOVE_UP, NEW_FOLDER and
- * NEW_FILE slots that are injected around the real directory entries.
- * classify_sprite() already handles ".." → MOVE_UP; we add two more.
- */
-#define SENTINEL_NEW_FOLDER "[ new folder ]"
-#define SENTINEL_NEW_FILE   "[ new file ]"
-
-/*
- * entry_type values used internally in show_explorer_listing.
- * Mirrors the LIST_TYPE_* wire constants but adds sentinel types.
- */
-#define ETYPE_DIR        1
-#define ETYPE_FILE       0
-#define ETYPE_MOVE_UP   -1
-#define ETYPE_NEW_FOLDER -2
-#define ETYPE_NEW_FILE   -3
-
-static int show_explorer_listing(char *listing, int *current_page_zero_based)
-{
-    /* ── Parse the raw listing from the server ───────────────────────── */
-    char **raw_entries = NULL;
-    int   *raw_types   = NULL;
-    int    raw_count   = parse_listing_entries(listing, &raw_entries, &raw_types);
-
-    /* ── Separate into dirs and files, sort each group alphabetically ── */
-    /* Worst case: raw_count dirs + raw_count files */
-    char **dirs      = malloc((size_t)raw_count * sizeof(*dirs));
-    char **files     = malloc((size_t)raw_count * sizeof(*files));
-    int    dir_count = 0, file_count = 0;
-
-    for (int i = 0; i < raw_count; i++)
-    {
-        if (raw_types && raw_types[i] == ETYPE_DIR)
-            dirs[dir_count++]   = raw_entries[i];
-        else
-            files[file_count++] = raw_entries[i];
-    }
-
-    /* Simple insertion sort (directories and files are typically small lists). */
-    for (int i = 1; i < dir_count; i++) {
-        char *key = dirs[i];
-        int j = i - 1;
-        while (j >= 0 && strcasecmp(dirs[j], key) > 0) { dirs[j+1] = dirs[j]; j--; }
-        dirs[j+1] = key;
-    }
-    for (int i = 1; i < file_count; i++) {
-        char *key = files[i];
-        int j = i - 1;
-        while (j >= 0 && strcasecmp(files[j], key) > 0) { files[j+1] = files[j]; j--; }
-        files[j+1] = key;
-    }
-
-    /*
-     * ── Build the final display array ───────────────────────────────────
-     *
-     * Layout:
-     *   [0]              MOVE_UP       ".."
-     *   [1 .. dir_count] DIR           real directories
-     *   [dir_count+1]    NEW_FOLDER    sentinel
-     *   [dir_count+2 ..] FILE          real files
-     *   [last]           NEW_FILE      sentinel
-     */
-    int total = 1 + dir_count + 1 + file_count + 1;  /* up + dirs + new_folder + files + new_file */
-
-    char **entries = malloc((size_t)total * sizeof(*entries));
-    int   *etypes  = malloc((size_t)total * sizeof(*etypes));
-
-    int idx = 0;
-    entries[idx] = "..";               etypes[idx] = ETYPE_MOVE_UP;    idx++;
-    for (int i = 0; i < dir_count;  i++) { entries[idx] = dirs[i];  etypes[idx] = ETYPE_DIR;        idx++; }
-    entries[idx] = SENTINEL_NEW_FOLDER; etypes[idx] = ETYPE_NEW_FOLDER; idx++;
-    for (int i = 0; i < file_count; i++) { entries[idx] = files[i]; etypes[idx] = ETYPE_FILE;       idx++; }
-    entries[idx] = SENTINEL_NEW_FILE;   etypes[idx] = ETYPE_NEW_FILE;   idx++;
-
-    free(dirs);
-    free(files);
-
-    /* ── Layout maths ────────────────────────────────────────────────── */
-    int width            = getmaxx(stdscr);
-    int height           = getmaxy(stdscr);
-    int available_width  = width - 2;
-    int available_height = (height - 2) - LIST_TOP_ROW;
-    int cols             = available_width  / TILE_WIDTH;
-    int rows             = available_height / TILE_HEIGHT;
-
-    if (cols < 1) cols = 1;
-    if (rows < 1) rows = 1;
-
-    int per_page   = cols * rows;
-    int page_count = (total + per_page - 1) / per_page;
-
-    int page = *current_page_zero_based;
-    if (page < 0)          page = 0;
-    if (page >= page_count) page = page_count - 1;
-    *current_page_zero_based = page;
-
-    /* ── Draw ────────────────────────────────────────────────────────── */
-    int start = page * per_page;
-    for (int i = 0; i < per_page && (start + i) < total; i++)
-    {
-        int grid_row = i / cols;
-        int grid_col = i % cols;
-        int draw_row = LIST_TOP_ROW + (grid_row * TILE_HEIGHT);
-        int draw_col = 2 + (grid_col * TILE_WIDTH);
-
-        enum SPRITES sprite;
-        const char  *label = entries[start + i];
-
-        switch (etypes[start + i])
-        {
-            case ETYPE_MOVE_UP:    sprite = MOVE_UP;    label = "..";           break;
-            case ETYPE_DIR:        sprite = FOLDER;     break;
-            case ETYPE_NEW_FOLDER: sprite = NEW_FOLDER; label = "New Folder";   break;
-            case ETYPE_FILE:       sprite = classify_sprite(label, 0);          break;
-            case ETYPE_NEW_FILE:   sprite = NEW_FILE;   label = "New File";     break;
-            default:               sprite = GENERIC_FILE; break;
-        }
-
-        draw_sprite(draw_row, draw_col, sprite, entries[start + i]);
-        mvprintw(draw_row + SPRITE_HEIGHT, draw_col, "%-20.20s", label);
-    }
-
-    free(entries);
-    free(etypes);
-    free_listing_entries(raw_entries, raw_types, raw_count);
-    return page_count;
-}
-
-static void show_explorer_footer(void)
-{
-    int width = getmaxx(stdscr);
-
-    move(getmaxy(stdscr) - 2, 0);
-    for (int i = 0; i < width; ++i) addch('-');
-
-    mvprintw(getmaxy(stdscr) - 1, 0,
-             "Commands: [Esc] Quit | [R] Refresh | [Left/Right] Page");
-}
-
-/* ── Application state ──────────────────────────────────────────────────── */
-
-typedef enum { STATE_LOGIN, STATE_EXPLORER } AppState;
-
-/* ── Entry point ────────────────────────────────────────────────────────── */
-
-int main(void)
-{
-    setlocale(LC_ALL, "");
-
-    initscr();
-    noecho();
-    cbreak();
-    nodelay(stdscr, FALSE);
-    keypad(stdscr, TRUE);
-
-    /* 0 = username field active, 1 = password field active. */
-    int      active_field     = 0;
-    AppState app_state        = STATE_LOGIN;
-    bool     needs_full_redraw = true;
-    char     debug_message[256] = {0};
-    debug_message[0] = '\0';
-    char *listing = NULL;
-    char *current_directory = "~";
-    int explorer_page = 0;
-    int explorer_max_pages = 1;
-
-    while (1)
-    {
-        /* ── Render ─────────────────────────────────────────────────────── */
-        if (app_state == STATE_LOGIN)
-        {
-            if (needs_full_redraw)
-            {
-                clear();
-                show_login_labels();
-
-                /*
-                 * The inactive field is shown from its stored plain string;
-                 * the active field is shown from g_input (live editing slot).
-                 * We temporarily swap g_input to render the inactive field,
-                 * then restore it — but it's simpler to just print the stored
-                 * strings directly for the inactive row.
-                 */
-                if (active_field == 0)
-                {
-                    /* username is live in g_input; password comes from stored string */
-                    redraw_field(USERNAME_ROW, false);
-
-                    /* Print stored password as stars without touching g_input */
-                    move(PASSWORD_ROW, INPUT_COL);
-                    clrtoeol();
-                    for (int i = 0; password[i]; i++) addch('*');
-                }
-                else
-                {
-                    /* password is live in g_input; username comes from stored string */
-                    move(USERNAME_ROW, INPUT_COL);
-                    clrtoeol();
-                    mvprintw(USERNAME_ROW, INPUT_COL, "%s", username);
-
-                    redraw_field(PASSWORD_ROW, true);
-                }
-
-                needs_full_redraw = false;
-            }
-
-            /* Keep the hardware cursor in the active field. */
-            if (active_field == 0)
-                move(USERNAME_ROW, INPUT_COL + g_input.cursor_position);
-            else
-                move(PASSWORD_ROW, INPUT_COL + g_input.cursor_position);
-
-            wrefresh(stdscr);
-        }
-        else if (app_state == STATE_EXPLORER)
-        {
-            if (needs_full_redraw)
-            {
-                clear();
-                explorer_max_pages = show_explorer_listing(listing, &explorer_page);
-                show_explorer_header(SERVER_ADDRESS, username, current_directory,
-                                     explorer_page + 1, explorer_max_pages, debug_message);
-                show_explorer_footer();
-                wrefresh(stdscr);
-                needs_full_redraw = false;
-            }
-        }
-
-        /* ── Input ──────────────────────────────────────────────────────── */
-        int ch = getch();
-
-        if (ch == 27) break; /* Escape – quit. */
-
-        if (ch == KEY_RESIZE)
-        {
-            needs_full_redraw = true;
-            continue;
-        }
-
-        if (app_state == STATE_LOGIN)
-        {
-            if (active_field == 0)
-            {
-                if (ch == '\n')
-                {
-                    flush_input_to(username); /* Save username, clear slot. */
-                    active_field      = 1;
-                    needs_full_redraw = true;
-                    /* Load any previously typed password back for editing. */
-                    load_input_from(password);
-                }
-                else if (handle_input(ch))
-                {
-                    redraw_field(USERNAME_ROW, false);
-                }
-            }
-            else /* active_field == 1 */
-            {
-                if (ch == '\n')
-                {
-                    flush_input_to(password); /* Save password, clear slot. */
-
-                    listing = list_directory(
-                        SERVER_ADDRESS, SERVER_PORT,
-                        username, password, current_directory);
-
-                    debug_message[0] = '\0';
-                    if (listing)
-                    {
-                        strncat(debug_message, listing, sizeof(debug_message) - 1);
-                    }
-
-                    if (listing != NULL)
-                    {
-                        explorer_page     = 0;
-                        explorer_max_pages = 1;
-                        app_state         = STATE_EXPLORER;
-                        needs_full_redraw = true;
-                    }
-                    else
-                    {
-                        mvprintw(PASSWORD_ROW + 1, LABEL_COL,
-                                 "Login failed. Press any key to retry.");
-                        wrefresh(stdscr);
-                        getch();
-
-                        /* Reload password into g_input so the user can edit it. */
-                        load_input_from(password);
-                        needs_full_redraw = true;
-                    }
-                }
-                else if (handle_input(ch))
-                {
-                    redraw_field(PASSWORD_ROW, true);
-                }
-            }
-        }
-        else if (app_state == STATE_EXPLORER)
-        {
-            if (ch == KEY_RIGHT)
-            {
-                if (explorer_page + 1 < explorer_max_pages)
-                {
-                    explorer_page++;
-                    needs_full_redraw = true;
-                }
-            }
-            else if (ch == KEY_LEFT)
-            {
-                if (explorer_page > 0)
-                {
-                    explorer_page--;
-                    needs_full_redraw = true;
-                }
-            }
-            else if (ch == 'r' || ch == 'R')
-            {
-                char *new_listing = list_directory(
-                    SERVER_ADDRESS, SERVER_PORT,
-                    username, password, current_directory);
-
-                if (new_listing)
-                {
-                    free(listing);
-                    listing = new_listing;
-                    explorer_page = 0;
-                    needs_full_redraw = true;
-                }
-            }
-        }
-    }
-
-    free(listing);
-    endwin();
+static int send_path_raw(int fd, const char *s) {
+    uint32_t len = (uint32_t)strlen(s);
+    if (len == 0 || len > 4096) return -1;
+
+    uint32_t len_be = htonl(len);
+    if (send_all(fd, &len_be, sizeof(len_be)) <= 0) return -1;
+    if (send_all(fd, s, len) <= 0) return -1;
     return 0;
+}
+
+/* ========== Path Manipulation Utilities ========== */
+
+/**
+ * @brief Extract the filename (basename) from a path
+ *
+ * Returns a pointer to the last component of the path after the final '/'.
+ * If no '/' is present, returns the entire path.
+ *
+ * @param path Full file path
+ * @return Pointer to basename within the same string (not a copy)
+ *
+ * @example
+ *   path_basename("/home/user/file.txt") → "file.txt"
+ *   path_basename("file.txt") → "file.txt"
+ */
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/**
+ * @brief Expand tilde (~) in paths to actual home directories
+ *
+ * Supports three formats:
+ * - "~/path" → authenticated user's home + "/path"
+ * - "~username/path" → specified user's home + "/path"
+ * - Paths without ~ → returned as-is (duplicated)
+ *
+ * Resolution order for "~/":
+ * 1. Authenticated user (current_username) via getpwnam()
+ * 2. $HOME environment variable
+ * 3. Fallback to "/root"
+ *
+ * @param path Path to expand
+ * @return Malloc'd expanded path, or duplicate of original on failure
+ * @note Caller must free() the returned string
+ * @note Uses system password database (pwd.h) for user lookup
+ */
+static char *expand_tilde(const char *path) {
+    // No tilde? Return a copy unchanged
+    if (!path || path[0] != '~') {
+        return strdup(path);
+    }
+
+    const char *home = NULL;
+    const char *rest = path + 1;  // Skip the '~'
+
+    // Case 1: "~" or "~/..." (authenticated user's home)
+    if (rest[0] == '/' || rest[0] == '\0') {
+        // Try authenticated user first
+        if (current_username[0] != '\0') {
+            struct passwd *pw = getpwnam(current_username);
+            if (pw) {
+                home = pw->pw_dir;
+            }
+        }
+        // Fallback to $HOME environment variable
+        if (!home) {
+            home = getenv("HOME");
+        }
+        // Last resort: assume root
+        if (!home) {
+            home = "/root";
+        }
+    }
+    // Case 2: "~username/..." (specific user's home)
+    else {
+        const char *slash = strchr(rest, '/');
+        size_t userlen = slash ? (size_t)(slash - rest) : strlen(rest);
+        char username[256];
+        if (userlen < sizeof(username)) {
+            memcpy(username, rest, userlen);
+            username[userlen] = '\0';
+            struct passwd *pw = getpwnam(username);
+            if (pw) {
+                home = pw->pw_dir;
+                rest = slash ? slash : "";  // Point to remainder after username
+            }
+        }
+    }
+
+    // If expansion failed, return original path as copy
+    if (!home) {
+        return strdup(path);
+    }
+
+    // Concatenate home + rest
+    size_t homelen = strlen(home);
+    size_t restlen = strlen(rest);
+    char *expanded = malloc(homelen + restlen + 1);
+    if (!expanded) return NULL;
+
+    memcpy(expanded, home, homelen);
+    memcpy(expanded + homelen, rest, restlen + 1);  // Include null terminator
+    return expanded;
+}
+
+/**
+ * @brief Recursively create all parent directories for a given path
+ *
+ * Splits the path at each '/' and creates directories incrementally.
+ * Ignores EEXIST errors (directory already exists).
+ * Used during uploads to ensure target directories exist.
+ *
+ * @param path Full file path whose parents should be created
+ * @return 0 on success, -1 on error (sets errno)
+ *
+ * @example
+ *   ensure_parent_dirs("/a/b/c/file.txt") creates /a, /a/b, /a/b/c
+ *
+ * @note Does not create the final component (assumes it's a file)
+ * @note Directories are created with mode 0755 (rwxr-xr-x)
+ */
+static int ensure_parent_dirs(const char *path) {
+    char tmp[4096 + 1];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp)) return -1;  // Path too long
+    memcpy(tmp, path, len + 1);
+    
+    // Walk through path, creating each directory component
+    for (size_t i = 1; i < len; ++i) {  // Start at 1 to skip leading '/'
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';  // Temporarily terminate string
+            if (mkdir(tmp, 0755) < 0 && errno != EEXIST) {
+                return -1;  // mkdir failed for reason other than "already exists"
+            }
+            tmp[i] = '/';  // Restore slash
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Get current authenticated user's home directory and root status
+ */
+static int get_user_home(char *home_out, size_t out_size, int *is_root_out) {
+    struct passwd *pw = getpwnam(current_username);
+    if (!pw || !pw->pw_dir) return -1;
+
+    if (strlen(pw->pw_dir) >= out_size) return -1;
+    strcpy(home_out, pw->pw_dir);
+    *is_root_out = (pw->pw_uid == 0) ? 1 : 0;
+    return 0;
+}
+
+/**
+ * @brief Check whether path is equal to or inside base directory
+ */
+static int path_is_within(const char *path, const char *base) {
+    size_t base_len = strlen(base);
+    if (strncmp(path, base, base_len) != 0) return 0;
+    return path[base_len] == '\0' || path[base_len] == '/';
+}
+
+/**
+ * @brief Resolve the closest existing ancestor of a path
+ */
+static int resolve_existing_ancestor(const char *path, char *resolved, size_t resolved_size) {
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(tmp)) return -1;
+    memcpy(tmp, path, len + 1);
+
+    while (1) {
+        char *rp = realpath(tmp, resolved);
+        if (rp) {
+            if (strlen(resolved) >= resolved_size) return -1;
+            return 0;
+        }
+
+        char *slash = strrchr(tmp, '/');
+        if (!slash) return -1;
+
+        if (slash == tmp) {
+            strcpy(tmp, "/");
+        } else {
+            *slash = '\0';
+        }
+    }
+}
+
+/**
+ * @brief Enforce per-user path policy (non-root users restricted to home)
+ */
+static int enforce_user_path_policy(const char *expanded_path, int for_upload) {
+    char user_home[PATH_MAX];
+    int is_root = 0;
+
+    if (get_user_home(user_home, sizeof(user_home), &is_root) != 0) {
+        return -1;
+    }
+    if (is_root) {
+        return 0;
+    }
+
+    if (expanded_path[0] != '/') {
+        return -1;
+    }
+
+    char resolved_home[PATH_MAX];
+    if (!realpath(user_home, resolved_home)) {
+        return -1;
+    }
+
+    char resolved_target[PATH_MAX];
+    int ok;
+    if (for_upload) {
+        if (resolve_existing_ancestor(expanded_path, resolved_target, sizeof(resolved_target)) != 0) {
+            return -1;
+        }
+        ok = path_is_within(resolved_target, resolved_home);
+    } else {
+        if (!realpath(expanded_path, resolved_target)) {
+            return -1;
+        }
+        ok = path_is_within(resolved_target, resolved_home);
+    }
+
+    return ok ? 0 : -1;
+}
+
+/**
+ * @brief Extract crypt setting (algorithm+salt) from shadow hash
+ */
+static int extract_crypt_setting(const char *stored_hash, char *out, size_t out_size) {
+    if (!stored_hash || stored_hash[0] == '\0') return -1;
+
+    // Modern modular format: $id$[params$]salt$hash
+    if (stored_hash[0] == '$') {
+        const char *last_dollar = strrchr(stored_hash, '$');
+        if (!last_dollar || last_dollar == stored_hash) return -1;
+
+        size_t setting_len = (size_t)(last_dollar - stored_hash) + 1; // include trailing '$'
+        if (setting_len >= out_size) return -1;
+        memcpy(out, stored_hash, setting_len);
+        out[setting_len] = '\0';
+        return 0;
+    }
+
+    // Legacy DES format uses first two chars as salt
+    if (strlen(stored_hash) < 2 || out_size < 3) return -1;
+    out[0] = stored_hash[0];
+    out[1] = stored_hash[1];
+    out[2] = '\0';
+    return 0;
+}
+
+/**
+ * @brief Authenticate current user with password hash response
+ */
+static int authenticate_user(int client_fd) {
+    struct spwd *sp = getspnam(current_username);
+    if (!sp || !sp->sp_pwdp || sp->sp_pwdp[0] == '\0' ||
+        sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    char setting[512];
+    if (extract_crypt_setting(sp->sp_pwdp, setting, sizeof(setting)) != 0) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (send_path_raw(client_fd, setting) != 0) {
+        return -1;
+    }
+
+    char *client_hash = recv_path_alloc(client_fd);
+    if (!client_hash) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    int ok = (strcmp(client_hash, sp->sp_pwdp) == 0);
+    free(client_hash);
+
+    unsigned char status = ok ? STATUS_OK : STATUS_ERROR;
+    if (send_all(client_fd, &status, 1) <= 0) {
+        return -1;
+    }
+
+    return ok ? 0 : -1;
+}
+
+/* ========== Protocol Mode Handlers ========== */
+
+/**
+ * @brief Handle DOWNLOAD mode (server → client)
+ *
+ * Protocol flow:
+ * 1. Receive requested file path from client
+ * 2. Expand tilde (~) in path
+ * 3. Open file for reading
+ * 4. Send STATUS_OK byte
+ * 5. Send filename length (4-byte big-endian) + filename string
+ * 6. Stream file contents in BUFFER_SIZE chunks until EOF
+ *
+ * @param client_fd Connected client socket
+ * @return 0 on success, -1 on error
+ *
+ * @note Sends STATUS_ERROR and closes on failure (file not found, etc.)
+ * @note Only sends the basename of the file, not the full path
+ */
+static int handle_download(int client_fd) {
+    char buffer[BUFFER_SIZE];
+    
+    // Step 1: Receive the file path client wants to download
+    char *requested_path = recv_path_alloc(client_fd);
+    if (!requested_path) {
+        printf("Invalid or missing requested path.\n");
+        return -1;
+    }
+
+    // Step 2: Expand tilde (~) to actual home directory
+    char *expanded_path = expand_tilde(requested_path);
+    free(requested_path);
+    if (!expanded_path) {
+        printf("Path expansion failed.\n");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (enforce_user_path_policy(expanded_path, 0) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    // Extract the filename (basename) for sending to client
+    const char *name = path_basename(expanded_path);
+    uint32_t name_len = (uint32_t)strlen(name);
+    
+    // CRITICAL: Copy filename before freeing expanded_path!
+    // The 'name' pointer points into 'expanded_path' memory,
+    // so we must copy it before free() to avoid use-after-free.
+    char name_copy[4096];
+    if (name_len >= sizeof(name_copy)) {
+        printf("Filename too long.\n");
+        free(expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+    memcpy(name_copy, name, name_len + 1);
+
+    // Step 3: Open the file for binary reading
+    FILE *f = fopen(expanded_path, "rb");
+    if (!f) {
+        perror("fopen");
+        printf("Hint: ensure requested file exists: %s\n", expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    printf("Sending file to client: %s\n", expanded_path);
+    free(expanded_path);  // No longer needed after opening file
+
+    // Step 4: Send STATUS_OK to indicate file was opened successfully
+    unsigned char status = STATUS_OK;
+    if (send_all(client_fd, &status, 1) <= 0) {
+        perror("send status");
+        fclose(f);
+        return -1;
+    }
+
+    // Step 5: Send filename length (big-endian) and filename string
+    uint32_t name_len_be = htonl(name_len);
+    if (send_all(client_fd, &name_len_be, sizeof(name_len_be)) <= 0) {
+        perror("send filename length");
+        fclose(f);
+        return -1;
+    }
+    if (send_all(client_fd, name_copy, name_len) <= 0) {
+        perror("send filename");
+        fclose(f);
+        return -1;
+    }
+
+    // Step 6: Stream file contents in chunks until EOF
+    size_t nread;
+    while ((nread = fread(buffer, 1, BUFFER_SIZE, f)) > 0) {
+        if (send_all(client_fd, buffer, nread) <= 0) {
+            perror("send file data");
+            fclose(f);
+            return -1;
+        }
+    }
+
+    // Check if loop ended due to error (not just EOF)
+    if (ferror(f)) {
+        perror("fread");
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    printf("File sent.\n");
+    return 0;
+}
+
+/**
+ * @brief Handle UPLOAD mode (client → server)
+ *
+ * Protocol flow:
+ * 1. Receive target file path from client
+ * 2. Expand tilde (~) in path
+ * 3. Create parent directories if needed
+ * 4. Open file for writing
+ * 5. Send STATUS_OK byte
+ * 6. Receive file contents in chunks until connection closes
+ * 7. Write received data to file
+ *
+ * @param client_fd Connected client socket
+ * @return 0 on success, -1 on error
+ *
+ * @note Sends STATUS_ERROR and closes on failure (permission denied, etc.)
+ * @note Automatically creates parent directories with mode 0755
+ * @note Overwrites existing files without warning
+ */
+static int handle_upload(int client_fd) {
+    char buffer[BUFFER_SIZE];
+    
+    // Step 1: Receive target path where file should be saved
+    char *target_path = recv_path_alloc(client_fd);
+    if (!target_path) {
+        printf("Invalid or missing target path.\n");
+        return -1;
+    }
+
+    // Step 2: Expand tilde (~) to actual home directory
+    char *expanded_path = expand_tilde(target_path);
+    free(target_path);
+    if (!expanded_path) {
+        printf("Path expansion failed.\n");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (enforce_user_path_policy(expanded_path, 1) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    // Step 3: Create parent directories if they don't exist
+    if (ensure_parent_dirs(expanded_path) != 0) {
+        perror("mkdir");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    printf("Receiving file for path: %s\n", expanded_path);
+
+    // Step 4: Open file for binary writing (overwrites existing file)
+    FILE *f = fopen(expanded_path, "wb");
+    if (!f) {
+        perror("fopen");
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    // Step 5: Send STATUS_OK to tell client we're ready to receive
+    unsigned char status = STATUS_OK;
+    send_all(client_fd, &status, 1);
+    free(expanded_path);  // No longer needed
+
+    // Step 6: Receive file data in chunks until connection closes
+    int n;
+    while ((n = recv(client_fd, buffer, BUFFER_SIZE, 0)) > 0) {
+        // Step 7: Write received chunk to disk
+        if (fwrite(buffer, 1, n, f) != (size_t)n) {
+            perror("fwrite");
+            fclose(f);
+            return -1;
+        }
+    }
+
+    // Check if loop ended due to error (not just connection close)
+    if (n < 0) {
+        perror("recv file data");
+    }
+
+    fclose(f);
+    if (n < 0) {
+        return -1;
+    }
+
+    printf("File saved.\n");
+    return 0;
+}
+
+/**
+ * @brief Handle LIST mode (directory listing)
+ *
+ * Protocol flow:
+ * 1. Receive directory path from client
+ * 2. Expand tilde (~) in path
+ * 3. Open directory for reading
+ * 4. Send STATUS_OK byte
+ * 5. For each entry (excluding "." and ".."):
+ *    - Send entry type byte (LIST_TYPE_DIR or LIST_TYPE_FILE)
+ *    - Send entry name length (4-byte big-endian)
+ *    - Send entry name string
+ * 6. Send end-of-list marker: type byte LIST_TYPE_EOL (0x00)
+ *
+ * @param client_fd Connected client socket
+ * @return 0 on success, -1 on error
+ *
+ * @note Sends STATUS_ERROR and closes on failure (permission denied, not a directory, etc.)
+ * @note Excludes "." and ".." entries from listing
+ * @note End-of-list is signaled by a LIST_TYPE_EOL (0x00) type byte with no following data
+ * @note Entries whose d_type is DT_UNKNOWN are treated as LIST_TYPE_FILE
+ */
+
+/** Type byte values for directory listing entries. */
+#define LIST_TYPE_EOL  0x00   /**< End-of-list marker (no length/name follows) */
+#define LIST_TYPE_FILE 0x01   /**< Regular file (or unknown type)              */
+#define LIST_TYPE_DIR  0x02   /**< Directory                                   */
+
+static int handle_list(int client_fd) {
+	// Step 1: Receive directory path to list
+	char *dir_path = recv_path_alloc(client_fd);
+	if (!dir_path) {
+		unsigned char status = STATUS_ERROR;
+		send_all(client_fd, &status, 1);
+		return -1;
+	}
+
+	// Step 2: Expand tilde (~) to actual home directory
+	char *expanded_path = expand_tilde(dir_path);
+	free(dir_path);
+	if (!expanded_path) {
+		unsigned char status = STATUS_ERROR;
+		send_all(client_fd, &status, 1);
+		return -1;
+	}
+
+    if (enforce_user_path_policy(expanded_path, 0) != 0) {
+        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+	// Step 3: Open directory for reading
+	DIR *dir = opendir(expanded_path);
+	if (!dir) {
+		perror("opendir");
+		unsigned char status = STATUS_ERROR;
+		send_all(client_fd, &status, 1);
+		free(expanded_path);
+		return -1;
+	}
+
+	printf("Listing directory: %s\n", expanded_path);
+	free(expanded_path);
+
+	// Step 4: Send STATUS_OK to indicate success
+	unsigned char status = STATUS_OK;
+	if (send_all(client_fd, &status, 1) <= 0) {
+		closedir(dir);
+		return -1;
+	}
+
+	// Step 5: Iterate through directory entries
+	struct dirent *entry;
+	while ((entry = readdir(dir)) != NULL) {
+		// Skip current directory and parent directory
+		if (strcmp(entry->d_name, ".") == 0 ||
+		    strcmp(entry->d_name, "..") == 0)
+			continue;
+
+		// Determine entry type byte from d_type
+		unsigned char type_byte;
+		if (entry->d_type == DT_DIR)
+			type_byte = LIST_TYPE_DIR;
+		else
+			type_byte = LIST_TYPE_FILE;  /* DT_REG, DT_LNK, DT_UNKNOWN, etc. */
+
+		// Send entry: type byte + length (4-byte big-endian) + name string
+		uint32_t len = (uint32_t)strlen(entry->d_name);
+		uint32_t len_be = htonl(len);
+
+		if (send_all(client_fd, &type_byte, 1) <= 0 ||
+		    send_all(client_fd, &len_be, sizeof(len_be)) <= 0 ||
+		    send_all(client_fd, entry->d_name, len) <= 0) {
+			perror("send directory entry");
+			closedir(dir);
+			return -1;
+		}
+	}
+
+	// Step 6: Send end-of-list marker (LIST_TYPE_EOL byte, no length/name follows)
+	unsigned char eol = LIST_TYPE_EOL;
+	send_all(client_fd, &eol, 1);
+
+	closedir(dir);
+	printf("Directory listing sent.\n");
+	return 0;
+}
+
+/* ========== Public API ========== */
+
+/**
+ * @brief Main entry point for handling an authenticated client session
+ *
+ * Called by main.c after receiving the unlock byte (0x01).
+ * This function orchestrates the entire session:
+ * 1. Authenticate user (receive username for tilde expansion)
+ * 2. Receive mode byte (D=download, U=upload, L=list)
+ * 3. Dispatch to appropriate handler
+ *
+ * Protocol sequence:
+ * - Client sends: 4-byte length + username string
+ * - Client sends: 1-byte mode ('D', 'U', or 'L')
+ * - Handler takes over based on mode
+ *
+ * @param client_fd Connected client socket (already unlocked)
+ * @return 0 on success, -1 on error or unknown mode
+ *
+ * @note Sets global current_username for tilde expansion
+ * @note Closes connection after handling (or on error)
+ * @note Returns to main.c's idle state after completion
+ */
+int handle_unlocked_session(int client_fd) {
+    // Step 1: Receive and store username for path expansion
+    char *username = recv_path_alloc(client_fd);
+    if (!username) {
+        printf("Invalid or missing username.\n");
+        return -1;
+    }
+    // Store username globally for expand_tilde() to use
+    strncpy(current_username, username, sizeof(current_username) - 1);
+    current_username[sizeof(current_username) - 1] = '\0';  // Ensure null termination
+    printf("Authenticated as user: %s\n", current_username);
+    free(username);
+
+    // Step 2: Authenticate password hash against system shadow entry
+    if (authenticate_user(client_fd) != 0) {
+        printf("Authentication failed for user: %s\n", current_username);
+        return -1;
+    }
+
+    // Step 3: Receive mode byte to determine operation
+    unsigned char mode;
+    int n = recv_exact(client_fd, &mode, 1);
+    if (n <= 0) {
+        perror("recv mode");
+        return -1;
+    }
+
+    // Step 4: Dispatch to appropriate handler
+    if (mode == MODE_DOWNLOAD) {
+        return handle_download(client_fd);
+    } else if (mode == MODE_UPLOAD) {
+        return handle_upload(client_fd);
+    } else if (mode == MODE_LIST) {
+        return handle_list(client_fd);
+    }
+
+    printf("Unknown mode byte: 0x%02x\n", mode);
+    return -1;
 }
