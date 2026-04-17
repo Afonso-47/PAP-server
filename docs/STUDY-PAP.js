@@ -76,15 +76,15 @@ class session_c = {
             var username = recv_path_alloc(client_file_descriptor)
             if (!username)
             {
-                printf("Invalid or missing username.\n"); // Print the errors on the server's real-time log (not automatically saved in anywhere)
-                return -1;
+                printf("Invalid or missing username.\n") // Print the errors on the server's real-time log (not automatically saved in anywhere)
+                return -1
             }
             
             // Store username globally for expand_tilde() to use
-            strncpy(current_username, username, sizeof(current_username) - 1);
-            current_username[sizeof(current_username) - 1] = '\0'; // Ensure null termination
-            printf("Authenticated as user: %s\n", current_username); // Print the username on the server's real-time log (not automatically saved in anywhere)
-            free(username);
+            strncpy(current_username, username, sizeof(current_username) - 1)
+            current_username[sizeof(current_username) - 1] = '\0' // Ensure null termination
+            printf("Authenticated as user: %s\n", current_username) // Print the username on the server's real-time log (not automatically saved in anywhere)
+            free(username)
 
             // --- Step 2 ---
             // Authenticate the password hash against system shadow entry
@@ -93,7 +93,41 @@ class session_c = {
             // Authenticate current user with password hash response
             function authenticate_user(client_file_descriptor)
             {
-                
+                // get the current user details from /etc/shadow
+                var shadow_password_entry = getspnam(current_username)
+
+                // Check if the shadow password entry exists and is valid (not empty, not locked)
+                if (!shadow_password_entry || !shadow_password_entry->sp_pwdp || shadow_password_entry->sp_pwdp[0] == '\0'
+                    shadow_password_entry->sp_pwdp[0] == '!' || shadow_password_entry->sp_pwdp[0] == '*')
+                {
+                    var status = STATUS_ERROR
+                    send_all(client_file_descriptor, dereference(status), 1)
+                    return -1
+                }
+
+                char setting[512];
+
+                function extract_crypt_settings(stored_hash, output_buffer, buffer_size)
+                {
+                    
+                }
+
+                // Extract the cryptographic settings (salt, algorithm identifier) from the shadow password entry and send them to the client for hashing the password
+                if (extract_crypt_settings(shadow_password_entry->sp_pwdp, setting, sizeof(setting)) != 0) {
+                    var status = STATUS_ERROR
+                    send_all(client_file_descriptor, dereference(status), 1)
+                    return -1
+                }
+
+                function send_path_raw(client_file_descriptor, setting)
+                {
+
+                }
+
+                // Send the settings to the client
+                if (send_path_raw(client_file_descriptor, setting) != 0) {
+                    return -1
+                }
             }
 
             if (authenticate_user(client_file_descriptor) != 0)

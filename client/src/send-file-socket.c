@@ -377,8 +377,8 @@ static char *recv_path_alloc_sock(sock_t sock)
  * Server sends a crypt setting (salt+algorithm string). Client computes
  * crypt(password, setting), sends the resulting hash, then waits for status.
  *
- * @param sock      Connected socket, right after sending username.
- * @param password  Plaintext password entered by user.
+ * @param sock      Connected socket, after sending the username.
+ * @param password  Plaintext password used for authentication.
  * @return          0 on success, -1 on failure.
  */
 static int authenticate_with_server(sock_t sock, const char *password)
