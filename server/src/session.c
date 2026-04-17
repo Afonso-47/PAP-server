@@ -1,4 +1,3 @@
-
 /**
  * @file session.c
  * @brief Session handler for PAP server bidirectional file transfer
@@ -40,6 +39,10 @@
 #endif
 
 #include "session.h"
+
+/* ========== Forward Declarations ========== */
+static int authenticate_user(int client_fd);
+static int enforce_user_path_policy(const char *expanded_path, int for_upload);
 
 /* ========== Protocol Constants ========== */
 #define BUFFER_SIZE 4096          /**< Size of file transfer buffer */
@@ -423,7 +426,19 @@ static int authenticate_user(int client_fd) {
         return -1;
     }
 
-    int ok = (strcmp(client_hash, sp->sp_pwdp) == 0);
+    /* Use constant-time comparison to prevent timing side-channel attacks.
+     * strcmp() short-circuits on the first mismatched byte, which leaks
+     * information about how many leading characters are correct. */
+    size_t stored_len = strlen(sp->sp_pwdp);
+    size_t client_len = strlen(client_hash);
+    int ok = 0;
+    if (stored_len == client_len) {
+        unsigned char diff = 0;
+        for (size_t i = 0; i < stored_len; i++) {
+            diff |= (unsigned char)client_hash[i] ^ (unsigned char)sp->sp_pwdp[i];
+        }
+        ok = (diff == 0);
+    }
     free(client_hash);
 
     unsigned char status = ok ? STATUS_OK : STATUS_ERROR;

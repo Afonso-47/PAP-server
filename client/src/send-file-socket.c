@@ -383,44 +383,46 @@ static char *recv_path_alloc_sock(sock_t sock)
  */
 static int authenticate_with_server(sock_t sock, const char *password)
 {
-	if (!password || password[0] == '\0') {
-		fprintf(stderr, "authenticate: empty password\n");
-		return -1;
-	}
+    if (!password || password[0] == '\0') {
+        fprintf(stderr, "authenticate: empty password\n");
+        return -1;
+    }
 
 #ifdef _WIN32
-	(void)sock;
-	fprintf(stderr, "authenticate: not supported on Windows build\n");
-	return -1;
+    (void)sock;
+    fprintf(stderr, "authenticate: not supported on Windows build\n");
+    return -1;
 #else
+
+	// After (correct — receive setting, hash it, send hash):
 	char *setting = recv_path_alloc_sock(sock);
 	if (!setting) {
-		fprintf(stderr, "authenticate: failed to receive auth challenge\n");
+		fprintf(stderr, "authenticate: failed to receive crypt setting\n");
 		return -1;
 	}
-
-	char *pw_hash = crypt(password, setting);
-	if (!pw_hash) {
-		free(setting);
+	char *hashed = crypt(password, setting);
+	free(setting);
+	if (!hashed) {
 		fprintf(stderr, "authenticate: crypt() failed\n");
 		return -1;
 	}
-
-	if (send_path(sock, pw_hash) != 0) {
-		free(setting);
-		fprintf(stderr, "authenticate: failed to send hash\n");
+	if (send_path(sock, hashed) != 0) {
+		fprintf(stderr, "authenticate: failed to send password hash\n");
 		return -1;
 	}
 
-	free(setting);
+    unsigned char status;
+    if (recv_exact(sock, &status, 1) != 0) {
+        fprintf(stderr, "authenticate: failed to receive status\n");
+        return -1;
+    }
 
-	unsigned char status;
-	if (recv_exact(sock, &status, 1) != 0 || status != 0x00) {
-		fprintf(stderr, "authenticate: server rejected credentials\n");
-		return -1;
-	}
+    if (status != 0x00) {
+        fprintf(stderr, "authenticate: server rejected credentials\n");
+        return -1;
+    }
 
-	return 0;
+    return 0;
 #endif
 }
 
@@ -472,7 +474,17 @@ int receive_file(sock_t sock, const char *output_dir, char *out_path)
 		return -1;
 	}
 
-	snprintf(out_path, MAX_PATH_LEN, "%s/%s", output_dir, filename);
+	size_t dir_len  = strlen(output_dir);
+	size_t file_len = strlen(filename);
+
+	if (dir_len + 1 + file_len >= MAX_PATH_LEN + 1) {
+	    fprintf(stderr, "receive_file: combined path too long\n");
+	    return -1;
+	}
+
+	memcpy(out_path, output_dir, dir_len);
+	out_path[dir_len] = '/';
+	memcpy(out_path + dir_len + 1, filename, file_len + 1);  /* +1 copies the null terminator */
 
 	FILE *fp = fopen(out_path, "wb");
 	if (!fp) {

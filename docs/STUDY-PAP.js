@@ -53,7 +53,7 @@ class session_c = {
                     return total; // return the number of bytes recieved (expected to be equal to the requested size)
                 }
                 
-                // Recieve the length of the string to recieve (first four bytes)
+                // Recieve the length of the string to recieve (first four Recieve and handle client commands (download, upload, list)bytes)
                 var n = recv_exact(client_file_descriptor, addressof(len_be), sizeof(len_be))
                 if (n <= 0) return NULL; // Error or connection closed
                 
@@ -80,12 +80,27 @@ class session_c = {
                 return -1;
             }
             
-            const "DETECTED PROBLEM WITH PROGRAM"
-            const "THIS PART OF THE CODE DOESN'T ALLOW MULTIPLE USERS TO JOIN AT THE SAME TIME"
-            const "MODIFICATION IS NEEDED TO CONNECT MULTIPLE USERS TO MULTIPLE PORTS"
-            const "AS WELL AS BLOCKING NEW USERS IF ALL PORTS ARE BEING USED ALREADY"
-            
             // Store username globally for expand_tilde() to use
+            strncpy(current_username, username, sizeof(current_username) - 1);
+            current_username[sizeof(current_username) - 1] = '\0'; // Ensure null termination
+            printf("Authenticated as user: %s\n", current_username); // Print the username on the server's real-time log (not automatically saved in anywhere)
+            free(username);
+
+            // --- Step 2 ---
+            // Authenticate the password hash against system shadow entry
+            // . . .
+
+            // Authenticate current user with password hash response
+            function authenticate_user(client_file_descriptor)
+            {
+                
+            }
+
+            if (authenticate_user(client_file_descriptor) != 0)
+            {
+                printf("Authentication failed for user: %s\n", current_username); // Print the username on the server's real-time log (not automatically saved in anywhere)
+                return -1;
+            }
         }
     }
     
