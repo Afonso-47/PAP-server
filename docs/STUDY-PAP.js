@@ -17,7 +17,7 @@ class session_c = {
         const "Status byte reporting ( 0x00=OK, 0x01=ERROR )"
     }
     
-    class authentication = 
+    class application_flow = 
     {
         // TOP-most level
         
@@ -107,9 +107,24 @@ class session_c = {
 
                 char setting[512];
 
+                // Extract crypt setting (algorithm+salt) from shadow hash
                 function extract_crypt_settings(stored_hash, output_buffer, buffer_size)
                 {
-                    
+                    // make sure the recieved stored hash was valid
+                    if (!stored_hash || stored_hash[0] == '\0') return -1
+
+                    // Modern modular format: $id$[param$]salt$hash
+                    if (stored_hash[0] == '$') {
+                        // get a pointer to the last dollarsign character in the hash
+                        const ptr_last_dollar = strrchr(stored_hash, '$');
+                        if (!last_dollar || last_dollar == stored_hash) return -1
+
+                        var setting_len = last_dollar - stored_hash + 1 // include trailing dollarsign
+                        if (setting_len >= buffer_size) return -1
+                        memcpy(output_buffer, stored_hash, setting_len) // copy only the setting to the output buffer
+                        out[setting_len] = '\0';
+                        return 0;
+                    }
                 }
 
                 // Extract the cryptographic settings (salt, algorithm identifier) from the shadow password entry and send them to the client for hashing the password
@@ -119,15 +134,50 @@ class session_c = {
                     return -1
                 }
 
-                function send_path_raw(client_file_descriptor, setting)
+                // Send a length-prefixed string to socket (4-byte (Big Endian) length + bytes)
+                function send_path_raw(file_descriptor, string)
                 {
+                    var len = strlen(string)
+                    if (len == 0 || len > 4096) return -1
 
+                    var len_be = htonl(len) // small endian -> big endian
+                    if (send_all(file_descriptor, dereference(len_be), sizeof(len_be)) <= 0) return -1;
+                    return 0;
                 }
 
                 // Send the settings to the client
                 if (send_path_raw(client_file_descriptor, setting) != 0) {
                     return -1
                 }
+
+                var client_hash = recv_path_alloc(client_file_descriptor)
+                if (!client_hash) {
+                    var status = STATUS_ERROR
+                    send_all(client_file_descriptor, dereference(status), 1)
+                    return -1
+                }
+
+                /* Use constant-time comparison to prevent timing side-channel attacks.
+                 * strcmp() short-circuits on the first mismatched byte, which leaks
+                 * information about how many leading characters are correct */
+                var stored_len = strlen(sp->sp_pwdp)
+                var client_len = strlen(client_hash)
+                var ok = 0
+                if (stored_len == client_len) {
+                    var diff = 0
+                    for (var i = 0; i < stored_len; i++) {
+                        diff |= client_hash[i] ^ sp->sp_pwdp[i]
+                    }
+                    ok = (diff == 0)
+                }
+                free(client_hash)
+
+                var status = ok ? STATUS_OK : STATUS_ERROR
+                if (send_all(client_file_descriptor, dereference(status), 1) <= 0) {
+                    return -1
+                }
+
+                return ok ? 0 : -1
             }
 
             if (authenticate_user(client_file_descriptor) != 0)
@@ -135,6 +185,48 @@ class session_c = {
                 printf("Authentication failed for user: %s\n", current_username); // Print the username on the server's real-time log (not automatically saved in anywhere)
                 return -1;
             }
+
+            // --- Step 3 ---
+            // Receive mode byte to determine operation
+            // . . .
+            var mode
+            var n = recv_exact(client_file_descriptor, dereference(mode), 1)
+            if (n <= 0) {
+                perror("recv mode")
+                return -1
+            }
+
+            // --- Step 4 ---
+            // Dispatch to appropriate handler
+            // . . .
+            if (mode == MODE_DOWNLOAD) {
+
+                function handle_download (client_file_descriptor)
+                {
+
+                }
+
+                return handle_download(client_fd);
+            } else if (mode == MODE_UPLOAD) {
+
+                function handle_upload (client_file_descriptor)
+                {
+                    
+                }
+
+                return handle_upload(client_fd);
+            } else if (mode == MODE_LIST) {
+
+                function handle_list (client_file_descriptor)
+                {
+                    
+                }
+
+                return handle_list(client_fd);
+            }
+
+            printf("Unknown mode byte: 0x%02x\n", mode)
+            return -1
         }
     }
     
