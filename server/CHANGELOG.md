@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-03-??
+- Added list-directory and sign-in as user capabilities.
+
 ## 2026-01-09
 - **TODO**: Refactor the code and make it YOURS. You need to know how it works and to be able to have the confidence to work on it yourself without Vibe Coding.
 - **NO MORE AI**:
