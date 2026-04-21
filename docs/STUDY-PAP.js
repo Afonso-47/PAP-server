@@ -201,9 +201,31 @@ class session_c = {
             // . . .
             if (mode == MODE_DOWNLOAD) {
 
+                // (server -> client)
+                /*
+                 * 1. Recieve requested file path from client
+                 * 2. Expand tilde if present using the authenticated username
+                 * 3. Open file for reading
+                 * 4. Send STATUS_OK byte
+                 * 5. Send filename length (4-byte big-endian) + filename string
+                 * 6. Stream file contents in BUFFER_SIZE chunks until EOF
+                 */
                 function handle_download (client_file_descriptor)
                 {
+                    var buffer; // 4096 bytes
 
+                    // --- Step 1 ---
+                    // Recieve the file path client wants to download
+                    // . . .
+                    var requested_path = recv_path_alloc(client_file_descriptor);
+                    if (!requested_path) {
+                        printf("Invalid or missing requested path.\n");
+                        return -1;
+                    }
+
+                    // --- Step 2 ---
+                    // Expand tilde to actual home directory
+                    // . . .
                 }
 
                 return handle_download(client_fd);
