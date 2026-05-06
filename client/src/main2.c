@@ -12,7 +12,7 @@
 #define DEBUG 0
 
 /* ── Network target ────────────────────────────────────────────────────── */
-#define SERVER_ADDRESS "10.0.0.1" //192.168.1.102
+#define SERVER_ADDRESS "192.168.1.102" //10.0.0.1
 #define SERVER_PORT    "9001"
 
 /* ── Layout constants ──────────────────────────────────────────────────── */
