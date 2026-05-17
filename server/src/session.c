@@ -39,6 +39,7 @@
 #endif
 
 #include "session.h"
+#include "logging.h"
 
 /* ========== Forward Declarations ========== */
 static int authenticate_user(int client_fd);
@@ -58,7 +59,8 @@ static int enforce_user_path_policy(const char *expanded_path, int for_upload);
  * This global stores the username sent by the client during authentication.
  * It is used by expand_tilde() to resolve ~ and ~user/ paths.
  */
-static char current_username[256] = {0};
+static char current_username[256]  = {0};
+static char current_client_ip[16] = {0};
 
 /* ========== Low-Level Socket Helpers ========== */
 
@@ -474,7 +476,7 @@ static int handle_download(int client_fd) {
     // Step 1: Receive the file path client wants to download
     char *requested_path = recv_path_alloc(client_fd);
     if (!requested_path) {
-        printf("Invalid or missing requested path.\n");
+        client_log(current_username, "[%s] Invalid or missing requested path.", current_username);
         return -1;
     }
 
@@ -482,14 +484,15 @@ static int handle_download(int client_fd) {
     char *expanded_path = expand_tilde(requested_path);
     free(requested_path);
     if (!expanded_path) {
-        printf("Path expansion failed.\n");
+        client_log(current_username, "[%s] Path expansion failed.", current_username);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         return -1;
     }
 
     if (enforce_user_path_policy(expanded_path, 0) != 0) {
-        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        client_log(current_username, "[%s] Access denied for user '%s': %s",
+                   current_client_ip, current_username, expanded_path);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         free(expanded_path);
@@ -505,7 +508,7 @@ static int handle_download(int client_fd) {
     // so we must copy it before free() to avoid use-after-free.
     char name_copy[4096];
     if (name_len >= sizeof(name_copy)) {
-        printf("Filename too long.\n");
+        client_log(current_username, "[%s] Filename too long.", current_username);
         free(expanded_path);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
@@ -517,14 +520,14 @@ static int handle_download(int client_fd) {
     FILE *f = fopen(expanded_path, "rb");
     if (!f) {
         perror("fopen");
-        printf("Hint: ensure requested file exists: %s\n", expanded_path);
+        client_log(current_username, "[%s] File not found: %s", current_username, expanded_path);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         free(expanded_path);
         return -1;
     }
 
-    printf("Sending file to client: %s\n", expanded_path);
+    client_log(current_username, "[%s] Sending file: %s", current_username, expanded_path);
     free(expanded_path);  // No longer needed after opening file
 
     // Step 4: Send STATUS_OK to indicate file was opened successfully
@@ -566,7 +569,7 @@ static int handle_download(int client_fd) {
     }
 
     fclose(f);
-    printf("File sent.\n");
+    client_log(current_username, "[%s] File sent successfully.", current_username);
     return 0;
 }
 
@@ -595,7 +598,7 @@ static int handle_upload(int client_fd) {
     // Step 1: Receive target path where file should be saved
     char *target_path = recv_path_alloc(client_fd);
     if (!target_path) {
-        printf("Invalid or missing target path.\n");
+        client_log(current_username, "[%s] Invalid or missing target path.", current_username);
         return -1;
     }
 
@@ -603,14 +606,15 @@ static int handle_upload(int client_fd) {
     char *expanded_path = expand_tilde(target_path);
     free(target_path);
     if (!expanded_path) {
-        printf("Path expansion failed.\n");
+        client_log(current_username, "[%s] Path expansion failed.", current_username);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         return -1;
     }
 
     if (enforce_user_path_policy(expanded_path, 1) != 0) {
-        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        client_log(current_username, "[%s] Access denied for user '%s': %s",
+                   current_client_ip, current_username, expanded_path);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         free(expanded_path);
@@ -626,7 +630,7 @@ static int handle_upload(int client_fd) {
         return -1;
     }
 
-    printf("Receiving file for path: %s\n", expanded_path);
+    client_log(current_username, "[%s] Receiving file at: %s", current_username, expanded_path);
 
     // Step 4: Open file for binary writing (overwrites existing file)
     FILE *f = fopen(expanded_path, "wb");
@@ -664,7 +668,7 @@ static int handle_upload(int client_fd) {
         return -1;
     }
 
-    printf("File saved.\n");
+    client_log(current_username, "[%s] File saved successfully.", current_username);
     return 0;
 }
 
@@ -715,7 +719,8 @@ static int handle_list(int client_fd) {
 	}
 
     if (enforce_user_path_policy(expanded_path, 0) != 0) {
-        printf("Access denied for user '%s': %s\n", current_username, expanded_path);
+        client_log(current_username, "[%s] Access denied for user '%s': %s",
+                   current_client_ip, current_username, expanded_path);
         unsigned char status = STATUS_ERROR;
         send_all(client_fd, &status, 1);
         free(expanded_path);
@@ -732,7 +737,7 @@ static int handle_list(int client_fd) {
 		return -1;
 	}
 
-	printf("Listing directory: %s\n", expanded_path);
+	client_log(current_username, "[%s] Listing directory: %s", current_username, expanded_path);
 	free(expanded_path);
 
 	// Step 4: Send STATUS_OK to indicate success
@@ -775,7 +780,7 @@ static int handle_list(int client_fd) {
 	send_all(client_fd, &eol, 1);
 
 	closedir(dir);
-	printf("Directory listing sent.\n");
+	client_log(current_username, "[%s] Directory listing sent.", current_username);
 	return 0;
 }
 
@@ -802,22 +807,27 @@ static int handle_list(int client_fd) {
  * @note Closes connection after handling (or on error)
  * @note Returns to main.c's idle state after completion
  */
-int handle_unlocked_session(int client_fd) {
+int handle_unlocked_session(int client_fd, const char *client_ip) {
+    /* Store IP for use by all logging calls within this session. */
+    strncpy(current_client_ip, client_ip, sizeof(current_client_ip) - 1);
+    current_client_ip[sizeof(current_client_ip) - 1] = '\0';
+
     // Step 1: Receive and store username for path expansion
     char *username = recv_path_alloc(client_fd);
     if (!username) {
-        printf("Invalid or missing username.\n");
+        client_log(current_client_ip, "[%s] Invalid or missing username.", current_client_ip);
         return -1;
     }
     // Store username globally for expand_tilde() to use
     strncpy(current_username, username, sizeof(current_username) - 1);
     current_username[sizeof(current_username) - 1] = '\0';  // Ensure null termination
-    printf("Authenticated as user: %s\n", current_username);
+    client_log(current_username, "Authenticated as user: %s", current_username);
     free(username);
 
     // Step 2: Authenticate password hash against system shadow entry
     if (authenticate_user(client_fd) != 0) {
-        printf("Authentication failed for user: %s\n", current_username);
+        client_log(current_username, "[%s] Authentication failed for user: %s",
+                   current_client_ip, current_username);
         return -1;
     }
 
@@ -838,6 +848,6 @@ int handle_unlocked_session(int client_fd) {
         return handle_list(client_fd);
     }
 
-    printf("Unknown mode byte: 0x%02x\n", mode);
+    client_log(current_username, "[%s] Unknown mode byte: 0x%02x", current_username, mode);
     return -1;
 }
