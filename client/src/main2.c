@@ -1,3 +1,12 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+ * TODO:
+ *  [ ] Implement selection of individual files and directories, with visual highlight and keyboard navigation.
+ *  [ ] Implement "open" action on selected entry: cd into directories, download files, and handle the special "move up" entry.
+ *  [ ] Implement ctrl+d shortcut to trigger file download of the currently selected entry.
+ *  [ ] Implement ctrl+u shortcut to trigger file upload to the current directory, prompting for a local file path.
+ *  [ ] Implement Delete key to delete the currently selected entry (with confirmation prompt).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 #include "./send-file-socket.c"
 
 #include <locale.h>
@@ -12,7 +21,7 @@
 #define DEBUG 0
 
 /* ── Network target ────────────────────────────────────────────────────── */
-#define SERVER_ADDRESS "192.168.1.102" //10.0.0.1
+#define SERVER_ADDRESS /**/ "192.168.1.102" /** / "10.0.0.1" /**/
 #define SERVER_PORT    "9001"
 
 /* ── Layout constants ──────────────────────────────────────────────────── */
