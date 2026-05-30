@@ -1,10 +1,19 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- * TODO:
- *  [ ] Implement selection of individual files and directories, with visual highlight and keyboard navigation.
- *  [ ] Implement "open" action on selected entry: cd into directories, download files, and handle the special "move up" entry.
- *  [ ] Implement ctrl+d shortcut to trigger file download of the currently selected entry.
- *  [ ] Implement ctrl+u shortcut to trigger file upload to the current directory, prompting for a local file path.
- *  [ ] Implement Delete key to delete the currently selected entry (with confirmation prompt).
+ * Implemented features:
+ *  [x] Selection of individual files and directories, with visual highlight
+ *      and keyboard navigation (arrow keys, Home, End, PgUp, PgDn).
+ *  [x] "Open" action on selected entry (Enter): cd into directories,
+ *      download files, handle the special "move up" entry.
+ *  [x] Ctrl+D shortcut – download the currently selected entry.
+ *  [x] Ctrl+U shortcut – upload a local file to the current directory
+ *      (prompts for a local file path).
+ *  [x] Delete key – delete the currently selected entry with a
+ *      confirmation prompt.
+ *
+ * Compile (send-file-socket.c is #included directly, do NOT pass it
+ * as a separate translation unit):
+ *
+ *   gcc main2.c -o main -Wall -Wextra -lcrypt -lncurses
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #include "./send-file-socket.c"
@@ -303,6 +312,49 @@ static enum SPRITES classify_sprite(const char *name, int is_dir)
     return GENERIC_FILE;
 }
 
+/**
+ * path_join - Safely join a directory path and a name into out_buf.
+ *
+ * Writes "dir/name" (or just "dir" when name is empty) into out_buf,
+ * clamping the result to out_size - 1 bytes.  Always NUL-terminates.
+ *
+ * @param out_buf   Destination buffer.
+ * @param out_size  Capacity of out_buf in bytes.
+ * @param dir       Directory component (may contain trailing slash, handled).
+ * @param name      Name component to append.
+ */
+static void path_join(char *out_buf, size_t out_size,
+                      const char *dir, const char *name)
+{
+    size_t dir_len  = strlen(dir);
+    /* Strip trailing slash from dir, unless it's exactly "/" */
+    while (dir_len > 1 && dir[dir_len - 1] == '/')
+        dir_len--;
+
+    if (!name || !name[0]) {
+        size_t copy = (dir_len < out_size - 1) ? dir_len : out_size - 1;
+        memcpy(out_buf, dir, copy);
+        out_buf[copy] = '\0';
+        return;
+    }
+
+    size_t name_len = strlen(name);
+    size_t total    = dir_len + 1 + name_len;   /* dir + '/' + name */
+
+    if (total >= out_size)
+        total = out_size - 1;
+
+    size_t dpart = (dir_len < total) ? dir_len : total;
+    memcpy(out_buf, dir, dpart);
+
+    size_t pos = dpart;
+    if (pos < total) { out_buf[pos++] = '/'; }
+
+    size_t npart = total - pos;
+    memcpy(out_buf + pos, name, npart);
+    out_buf[total] = '\0';
+}
+
 static int parse_listing_entries(const char *listing, char ***entries_out, int **types_out)
 {
     char  *copy;
@@ -541,7 +593,8 @@ static void show_explorer_header(char *ip_address, char *uname, char *current_di
 #define ETYPE_NEW_FOLDER -2
 #define ETYPE_NEW_FILE   -3
 
-static int show_explorer_listing(char *listing, int *current_page_zero_based)
+static int show_explorer_listing(char *listing, int *current_page_zero_based,
+                                 int selected_index, int *total_entries_out)
 {
     /* ── Parse the raw listing from the server ───────────────────────── */
     char **raw_entries = NULL;
@@ -642,9 +695,20 @@ static int show_explorer_listing(char *listing, int *current_page_zero_based)
             default:               sprite = GENERIC_FILE; break;
         }
 
+        /* Highlight the selected tile with reverse video. */
+        int global_idx = start + i;
+        if (global_idx == selected_index)
+            attron(A_REVERSE);
+
         draw_sprite(draw_row, draw_col, sprite, entries[start + i]);
         mvprintw(draw_row + SPRITE_HEIGHT, draw_col, "%-20.20s", label);
+
+        if (global_idx == selected_index)
+            attroff(A_REVERSE);
     }
+
+    if (total_entries_out)
+        *total_entries_out = total;
 
     free(entries);
     free(etypes);
@@ -660,7 +724,8 @@ static void show_explorer_footer(void)
     for (int i = 0; i < width; ++i) addch('-');
 
     mvprintw(getmaxy(stdscr) - 1, 0,
-             "Commands: [Esc] Quit | [R] Refresh | [Left/Right] Page");
+             "Commands: [Esc] Quit | [R] Refresh | [Arrows] Navigate | [Enter] Open"
+             " | [^D] Download | [^U] Upload | [Del] Delete");
 }
 
 /* ── Application state ──────────────────────────────────────────────────── */
@@ -686,8 +751,15 @@ int main(void)
     char     debug_message[256] = {0};
     debug_message[0] = '\0';
     char *listing = NULL;
-    int explorer_page = 0;
-    int explorer_max_pages = 1;
+    int explorer_page       = 0;
+    int explorer_max_pages  = 1;
+    int explorer_selected   = 0;   /* Global index of highlighted entry. */
+    int explorer_total      = 0;   /* Total number of entries on this listing. */
+
+    /* Current remote directory path (absolute, no trailing slash). */
+    char current_path[MAX_PATH_LEN + 1];
+    strncpy(current_path, "~", sizeof(current_path) - 1);
+    current_path[sizeof(current_path) - 1] = '\0';
 
     while (1)
     {
@@ -742,8 +814,9 @@ int main(void)
             if (needs_full_redraw)
             {
                 clear();
-                explorer_max_pages = show_explorer_listing(listing, &explorer_page);
-                show_explorer_header(SERVER_ADDRESS, username, "~",
+                explorer_max_pages = show_explorer_listing(listing, &explorer_page,
+                                                           explorer_selected, &explorer_total);
+                show_explorer_header(SERVER_ADDRESS, username, current_path,
                                      explorer_page + 1, explorer_max_pages, debug_message);
                 show_explorer_footer();
                 wrefresh(stdscr);
@@ -797,10 +870,14 @@ int main(void)
 
                     if (listing != NULL)
                     {
-                        explorer_page     = 0;
+                        strncpy(current_path, "~", sizeof(current_path) - 1);
+                        current_path[sizeof(current_path) - 1] = '\0';
+                        explorer_page      = 0;
                         explorer_max_pages = 1;
-                        app_state         = STATE_EXPLORER;
-                        needs_full_redraw = true;
+                        explorer_selected  = 0;
+                        explorer_total     = 0;
+                        app_state          = STATE_EXPLORER;
+                        needs_full_redraw  = true;
                     }
                     else
                     {
@@ -822,33 +899,524 @@ int main(void)
         }
         else if (app_state == STATE_EXPLORER)
         {
-            if (ch == KEY_RIGHT)
+            /* ── Compute layout to know cols/rows for arrow navigation ── */
+            int width            = getmaxx(stdscr);
+            int height           = getmaxy(stdscr);
+            int available_width  = width - 2;
+            int available_height = (height - 2) - LIST_TOP_ROW;
+            int nav_cols         = available_width  / TILE_WIDTH;
+            int nav_rows         = available_height / TILE_HEIGHT;
+            if (nav_cols < 1) nav_cols = 1;
+            if (nav_rows < 1) nav_rows = 1;
+            int per_page = nav_cols * nav_rows;
+
+            /* ── Helper: get entry name + type at global index ────────── */
+            /* (We re-parse only when we need entry info – lightweight.) */
+
+            if (ch == KEY_UP)
             {
-                if (explorer_page + 1 < explorer_max_pages)
+                if (explorer_selected - nav_cols >= 0)
                 {
-                    explorer_page++;
+                    explorer_selected -= nav_cols;
+                    /* If selected scrolled off current page, go to prev page. */
+                    int new_page = explorer_selected / per_page;
+                    if (new_page != explorer_page)
+                        explorer_page = new_page;
+                    needs_full_redraw = true;
+                }
+            }
+            else if (ch == KEY_DOWN)
+            {
+                if (explorer_selected + nav_cols < explorer_total)
+                {
+                    explorer_selected += nav_cols;
+                    int new_page = explorer_selected / per_page;
+                    if (new_page != explorer_page)
+                        explorer_page = new_page;
                     needs_full_redraw = true;
                 }
             }
             else if (ch == KEY_LEFT)
             {
+                if (explorer_selected % nav_cols > 0)
+                {
+                    explorer_selected--;
+                    needs_full_redraw = true;
+                }
+                else if (explorer_page > 0)
+                {
+                    /* At left edge: go to previous page, last column. */
+                    explorer_page--;
+                    int page_start = explorer_page * per_page;
+                    int page_end   = page_start + per_page - 1;
+                    if (page_end >= explorer_total)
+                        page_end = explorer_total - 1;
+                    explorer_selected = page_end;
+                    needs_full_redraw = true;
+                }
+            }
+            else if (ch == KEY_RIGHT)
+            {
+                if (explorer_selected % nav_cols < nav_cols - 1 &&
+                    explorer_selected + 1 < explorer_total)
+                {
+                    explorer_selected++;
+                    needs_full_redraw = true;
+                }
+                else if (explorer_page + 1 < explorer_max_pages)
+                {
+                    /* At right edge: go to next page, first column. */
+                    explorer_page++;
+                    explorer_selected = explorer_page * per_page;
+                    needs_full_redraw = true;
+                }
+            }
+            else if (ch == KEY_HOME)
+            {
+                explorer_selected = 0;
+                explorer_page     = 0;
+                needs_full_redraw = true;
+            }
+            else if (ch == KEY_END)
+            {
+                explorer_selected = explorer_total > 0 ? explorer_total - 1 : 0;
+                explorer_page     = explorer_selected / per_page;
+                needs_full_redraw = true;
+            }
+            else if (ch == KEY_PPAGE) /* Page Up */
+            {
                 if (explorer_page > 0)
                 {
                     explorer_page--;
+                    explorer_selected = explorer_page * per_page;
                     needs_full_redraw = true;
                 }
+            }
+            else if (ch == KEY_NPAGE) /* Page Down */
+            {
+                if (explorer_page + 1 < explorer_max_pages)
+                {
+                    explorer_page++;
+                    explorer_selected = explorer_page * per_page;
+                    needs_full_redraw = true;
+                }
+            }
+            /* ── Enter: open selected entry ──────────────────────────── */
+            else if (ch == '\n' || ch == KEY_ENTER)
+            {
+                /* Re-parse listing to find the selected entry. */
+                char **raw_entries = NULL;
+                int   *raw_types   = NULL;
+                int    raw_count   = parse_listing_entries(listing,
+                                                           &raw_entries, &raw_types);
+
+                /* Rebuild the sorted display order (mirrors show_explorer_listing). */
+                char **dirs  = malloc((size_t)raw_count * sizeof(*dirs));
+                char **files = malloc((size_t)raw_count * sizeof(*files));
+                int    dc = 0, fc = 0;
+                for (int i = 0; i < raw_count; i++) {
+                    if (raw_types && raw_types[i] == ETYPE_DIR) dirs[dc++]  = raw_entries[i];
+                    else                                         files[fc++] = raw_entries[i];
+                }
+                for (int i = 1; i < dc; i++) {
+                    char *k = dirs[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(dirs[j], k) > 0) { dirs[j+1] = dirs[j]; j--; }
+                    dirs[j+1] = k;
+                }
+                for (int i = 1; i < fc; i++) {
+                    char *k = files[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(files[j], k) > 0) { files[j+1] = files[j]; j--; }
+                    files[j+1] = k;
+                }
+
+                /* total layout: [MOVE_UP] [dirs...] [NEW_FOLDER] [files...] [NEW_FILE] */
+                int sel = explorer_selected;
+                const char *sel_name = NULL;
+                int         sel_type = -1;  /* ETYPE_* */
+
+                if (sel == 0) {
+                    sel_name = "..";
+                    sel_type = ETYPE_MOVE_UP;
+                } else if (sel <= dc) {
+                    sel_name = dirs[sel - 1];
+                    sel_type = ETYPE_DIR;
+                } else if (sel == dc + 1) {
+                    sel_type = ETYPE_NEW_FOLDER;
+                } else if (sel <= dc + 1 + fc) {
+                    sel_name = files[sel - dc - 2];
+                    sel_type = ETYPE_FILE;
+                } else {
+                    sel_type = ETYPE_NEW_FILE;
+                }
+
+                if (sel_type == ETYPE_MOVE_UP)
+                {
+                    /* Navigate to parent directory. */
+                    char parent[MAX_PATH_LEN + 1];
+                    strncpy(parent, current_path, sizeof(parent) - 1);
+                    parent[sizeof(parent) - 1] = '\0';
+                    char *slash = strrchr(parent, '/');
+                    if (slash && slash != parent)
+                        *slash = '\0';
+                    else if (slash == parent)
+                        slash[1] = '\0';  /* root "/" */
+                    else
+                        strncpy(parent, "/", sizeof(parent) - 1);
+
+                    char *new_listing = list_directory(
+                        SERVER_ADDRESS, SERVER_PORT, username, password, parent);
+                    if (new_listing) {
+                        free(listing);
+                        listing = new_listing;
+                        strncpy(current_path, parent, sizeof(current_path) - 1);
+                        current_path[sizeof(current_path) - 1] = '\0';
+                        explorer_page     = 0;
+                        explorer_selected = 0;
+                        needs_full_redraw = true;
+                    }
+                }
+                else if (sel_type == ETYPE_DIR && sel_name)
+                {
+                    /* Navigate into subdirectory. */
+                    char new_path[MAX_PATH_LEN + 1];
+                    path_join(new_path, sizeof(new_path), current_path, sel_name);
+
+                    char *new_listing = list_directory(
+                        SERVER_ADDRESS, SERVER_PORT, username, password, new_path);
+                    if (new_listing) {
+                        free(listing);
+                        listing = new_listing;
+                        strncpy(current_path, new_path, sizeof(current_path) - 1);
+                        current_path[sizeof(current_path) - 1] = '\0';
+                        explorer_page     = 0;
+                        explorer_selected = 0;
+                        needs_full_redraw = true;
+                    }
+                }
+                else if (sel_type == ETYPE_FILE && sel_name)
+                {
+                    /* Download the selected file. */
+                    char remote_path[MAX_PATH_LEN + 1];
+                    path_join(remote_path, sizeof(remote_path), current_path, sel_name);
+
+                    char download_dir[MAX_PATH_LEN + 1];
+                    if (!get_default_download_dir(download_dir, sizeof(download_dir)))
+                        strncpy(download_dir, ".", sizeof(download_dir) - 1);
+
+                    char saved_path[MAX_PATH_LEN + 1] = {0};
+                    int rc = download_from_server(SERVER_ADDRESS, SERVER_PORT,
+                                                  username, password,
+                                                  remote_path, download_dir, saved_path);
+
+                    /* Brief status overlay at the bottom. */
+                    move(getmaxy(stdscr) - 1, 0);
+                    clrtoeol();
+                    if (rc == ERR_NONE)
+                        mvprintw(getmaxy(stdscr) - 1, 0,
+                                 "Downloaded → %s  (press any key)", saved_path);
+                    else
+                        mvprintw(getmaxy(stdscr) - 1, 0,
+                                 "Download failed (err=%d)  (press any key)", rc);
+                    wrefresh(stdscr);
+                    getch();
+                    needs_full_redraw = true;
+                }
+
+                free(dirs);
+                free(files);
+                free_listing_entries(raw_entries, raw_types, raw_count);
+            }
+            /* ── Ctrl+D: download selected entry ─────────────────────── */
+            else if (ch == 4) /* Ctrl+D */
+            {
+                char **raw_entries = NULL;
+                int   *raw_types   = NULL;
+                int    raw_count   = parse_listing_entries(listing,
+                                                           &raw_entries, &raw_types);
+                char **dirs  = malloc((size_t)raw_count * sizeof(*dirs));
+                char **files = malloc((size_t)raw_count * sizeof(*files));
+                int    dc = 0, fc = 0;
+                for (int i = 0; i < raw_count; i++) {
+                    if (raw_types && raw_types[i] == ETYPE_DIR) dirs[dc++]  = raw_entries[i];
+                    else                                         files[fc++] = raw_entries[i];
+                }
+                for (int i = 1; i < dc; i++) {
+                    char *k = dirs[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(dirs[j], k) > 0) { dirs[j+1] = dirs[j]; j--; }
+                    dirs[j+1] = k;
+                }
+                for (int i = 1; i < fc; i++) {
+                    char *k = files[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(files[j], k) > 0) { files[j+1] = files[j]; j--; }
+                    files[j+1] = k;
+                }
+
+                int sel = explorer_selected;
+                const char *sel_name = NULL;
+                int         sel_type = -1;
+
+                if (sel == 0) {
+                    sel_type = ETYPE_MOVE_UP;
+                } else if (sel <= dc) {
+                    sel_name = dirs[sel - 1];
+                    sel_type = ETYPE_DIR;
+                } else if (sel == dc + 1) {
+                    sel_type = ETYPE_NEW_FOLDER;
+                } else if (sel <= dc + 1 + fc) {
+                    sel_name = files[sel - dc - 2];
+                    sel_type = ETYPE_FILE;
+                } else {
+                    sel_type = ETYPE_NEW_FILE;
+                }
+
+                move(getmaxy(stdscr) - 1, 0);
+                clrtoeol();
+
+                if ((sel_type == ETYPE_FILE || sel_type == ETYPE_DIR) && sel_name)
+                {
+                    char remote_path[MAX_PATH_LEN + 1];
+                    path_join(remote_path, sizeof(remote_path), current_path, sel_name);
+
+                    char download_dir[MAX_PATH_LEN + 1];
+                    if (!get_default_download_dir(download_dir, sizeof(download_dir)))
+                        strncpy(download_dir, ".", sizeof(download_dir) - 1);
+
+                    char saved_path[MAX_PATH_LEN + 1] = {0};
+                    int rc = download_from_server(SERVER_ADDRESS, SERVER_PORT,
+                                                  username, password,
+                                                  remote_path, download_dir, saved_path);
+
+                    if (rc == ERR_NONE)
+                        mvprintw(getmaxy(stdscr) - 1, 0,
+                                 "Downloaded → %s  (press any key)", saved_path);
+                    else
+                        mvprintw(getmaxy(stdscr) - 1, 0,
+                                 "Download failed (err=%d)  (press any key)", rc);
+                }
+                else
+                {
+                    mvprintw(getmaxy(stdscr) - 1, 0,
+                             "Select a file or directory to download.  (press any key)");
+                }
+                wrefresh(stdscr);
+                getch();
+                needs_full_redraw = true;
+
+                free(dirs);
+                free(files);
+                free_listing_entries(raw_entries, raw_types, raw_count);
+            }
+            /* ── Ctrl+U: upload a local file to current directory ─────── */
+            else if (ch == 21) /* Ctrl+U */
+            {
+                /* Prompt for a local file path using the shared input slot. */
+                memset(&g_input, 0, sizeof g_input);
+                g_input.max_length = INPUT_BUF_MAX;
+
+                int prompt_row = getmaxy(stdscr) - 1;
+                move(prompt_row, 0);
+                clrtoeol();
+                mvprintw(prompt_row, 0, "Upload local file: ");
+                wrefresh(stdscr);
+                echo();
+                curs_set(1);
+
+                int done = 0;
+                while (!done)
+                {
+                    int uch = getch();
+                    if (uch == '\n')
+                    {
+                        done = 1;
+                    }
+                    else if (uch == 27) /* Escape – cancel */
+                    {
+                        memset(&g_input, 0, sizeof g_input);
+                        g_input.max_length = INPUT_BUF_MAX;
+                        done = -1;
+                    }
+                    else if (handle_input(uch))
+                    {
+                        /* Redraw the prompt + typed text. */
+                        move(prompt_row, 0);
+                        clrtoeol();
+                        mvprintw(prompt_row, 0, "Upload local file: %s", g_input.buffer);
+                        move(prompt_row, 19 + g_input.cursor_position);
+                        wrefresh(stdscr);
+                    }
+                }
+                noecho();
+                curs_set(0);
+
+                if (done == 1 && g_input.length > 0)
+                {
+                    char local_file[INPUT_BUF_MAX];
+                    flush_input_to(local_file);
+
+                    /* Build the remote target path: current_path/basename(local_file) */
+                    const char *basename_start = strrchr(local_file, '/');
+                    const char *base = basename_start ? basename_start + 1 : local_file;
+                    char remote_target[MAX_PATH_LEN + 1];
+                    path_join(remote_target, sizeof(remote_target), current_path, base);
+
+                    int rc = upload_to_server(SERVER_ADDRESS, SERVER_PORT,
+                                             username, password,
+                                             local_file, remote_target);
+
+                    move(prompt_row, 0);
+                    clrtoeol();
+                    if (rc == ERR_NONE)
+                        mvprintw(prompt_row, 0,
+                                 "Uploaded → %s  (press any key)", remote_target);
+                    else
+                        mvprintw(prompt_row, 0,
+                                 "Upload failed (err=%d)  (press any key)", rc);
+                    wrefresh(stdscr);
+                    getch();
+
+                    /* Refresh listing to show the new file. */
+                    char *new_listing = list_directory(SERVER_ADDRESS, SERVER_PORT,
+                                                       username, password, current_path);
+                    if (new_listing) {
+                        free(listing);
+                        listing = new_listing;
+                        explorer_page = 0;
+                    }
+                }
+                else
+                {
+                    /* Cancelled or empty – restore the footer. */
+                    memset(&g_input, 0, sizeof g_input);
+                    g_input.max_length = INPUT_BUF_MAX;
+                }
+
+                needs_full_redraw = true;
+            }
+            /* ── Delete key: delete selected entry with confirmation ──── */
+            else if (ch == KEY_DC || ch == KEY_BACKSPACE || ch == 127)
+            {
+                /* Only treat KEY_DC (true Delete) as the delete trigger;
+                 * Backspace is intentionally not wired here so it doesn't
+                 * accidentally delete entries.  Use only KEY_DC. */
+                if (ch != KEY_DC)
+                    goto skip_delete;
+
+                char **raw_entries = NULL;
+                int   *raw_types   = NULL;
+                int    raw_count   = parse_listing_entries(listing,
+                                                           &raw_entries, &raw_types);
+                char **dirs  = malloc((size_t)raw_count * sizeof(*dirs));
+                char **files = malloc((size_t)raw_count * sizeof(*files));
+                int    dc = 0, fc = 0;
+                for (int i = 0; i < raw_count; i++) {
+                    if (raw_types && raw_types[i] == ETYPE_DIR) dirs[dc++]  = raw_entries[i];
+                    else                                         files[fc++] = raw_entries[i];
+                }
+                for (int i = 1; i < dc; i++) {
+                    char *k = dirs[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(dirs[j], k) > 0) { dirs[j+1] = dirs[j]; j--; }
+                    dirs[j+1] = k;
+                }
+                for (int i = 1; i < fc; i++) {
+                    char *k = files[i]; int j = i - 1;
+                    while (j >= 0 && strcasecmp(files[j], k) > 0) { files[j+1] = files[j]; j--; }
+                    files[j+1] = k;
+                }
+
+                int sel = explorer_selected;
+                const char *sel_name = NULL;
+                int         sel_type = -1;
+
+                if (sel == 0) {
+                    sel_type = ETYPE_MOVE_UP;
+                } else if (sel <= dc) {
+                    sel_name = dirs[sel - 1];
+                    sel_type = ETYPE_DIR;
+                } else if (sel == dc + 1) {
+                    sel_type = ETYPE_NEW_FOLDER;
+                } else if (sel <= dc + 1 + fc) {
+                    sel_name = files[sel - dc - 2];
+                    sel_type = ETYPE_FILE;
+                } else {
+                    sel_type = ETYPE_NEW_FILE;
+                }
+
+                int prompt_row = getmaxy(stdscr) - 1;
+                move(prompt_row, 0);
+                clrtoeol();
+
+                if ((sel_type == ETYPE_FILE || sel_type == ETYPE_DIR) && sel_name)
+                {
+                    char remote_path[MAX_PATH_LEN + 1];
+                    path_join(remote_path, sizeof(remote_path), current_path, sel_name);
+
+                    mvprintw(prompt_row, 0,
+                             "Delete '%s'? [y/N]: ", remote_path);
+                    wrefresh(stdscr);
+                    int confirm = getch();
+
+                    move(prompt_row, 0);
+                    clrtoeol();
+
+                    if (confirm == 'y' || confirm == 'Y')
+                    {
+                        int rc = delete_from_server(SERVER_ADDRESS, SERVER_PORT,
+                                                    username, password, remote_path);
+
+                        if (rc == ERR_NONE)
+                            mvprintw(prompt_row, 0,
+                                     "Deleted '%s'.  (press any key)", sel_name);
+                        else
+                            mvprintw(prompt_row, 0,
+                                     "Delete failed (err=%d).  (press any key)", rc);
+                        wrefresh(stdscr);
+                        getch();
+
+                        /* Refresh listing. */
+                        char *new_listing = list_directory(SERVER_ADDRESS, SERVER_PORT,
+                                                           username, password, current_path);
+                        if (new_listing) {
+                            free(listing);
+                            listing = new_listing;
+                            if (explorer_selected > 0 && rc == ERR_NONE)
+                                explorer_selected--;
+                            explorer_page = explorer_selected / per_page;
+                        }
+                    }
+                    else
+                    {
+                        mvprintw(prompt_row, 0, "Delete cancelled.");
+                        wrefresh(stdscr);
+                        napms(600);
+                    }
+                }
+                else
+                {
+                    mvprintw(prompt_row, 0,
+                             "Select a file or directory to delete.  (press any key)");
+                    wrefresh(stdscr);
+                    getch();
+                }
+
+                free(dirs);
+                free(files);
+                free_listing_entries(raw_entries, raw_types, raw_count);
+                needs_full_redraw = true;
+
+                skip_delete: ;
             }
             else if (ch == 'r' || ch == 'R')
             {
                 char *new_listing = list_directory(
                     SERVER_ADDRESS, SERVER_PORT,
-                    username, password, "~");
+                    username, password, current_path);
 
                 if (new_listing)
                 {
                     free(listing);
                     listing = new_listing;
-                    explorer_page = 0;
+                    explorer_page     = 0;
+                    explorer_selected = 0;
                     needs_full_redraw = true;
                 }
             }

@@ -50,6 +50,7 @@ static int enforce_user_path_policy(const char *expanded_path, int for_upload);
 #define MODE_DOWNLOAD 'D'         /**< Download mode: server → client */
 #define MODE_UPLOAD   'U'         /**< Upload mode: client → server */
 #define MODE_LIST     'L'         /**< List mode: directory listing */
+#define MODE_DELETE   'X'         /**< Delete mode: remove file or directory */
 #define STATUS_OK 0x00            /**< Status byte: operation succeeded */
 #define STATUS_ERROR 0x01         /**< Status byte: operation failed */
 
@@ -787,6 +788,63 @@ static int handle_list(int client_fd) {
 /* ========== Public API ========== */
 
 /**
+ * @brief Handle DELETE mode (remove a file or empty/recursive directory)
+ *
+ * Protocol flow:
+ * 1. Receive remote path from client
+ * 2. Expand tilde, enforce path policy
+ * 3. Attempt unlink() (file) or rmdir() (directory); send STATUS_OK / STATUS_ERROR
+ *
+ * @param client_fd Connected client socket
+ * @return 0 on success, -1 on error
+ */
+static int handle_delete(int client_fd) {
+    char *target_path = recv_path_alloc(client_fd);
+    if (!target_path) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    char *expanded_path = expand_tilde(target_path);
+    free(target_path);
+    if (!expanded_path) {
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        return -1;
+    }
+
+    if (enforce_user_path_policy(expanded_path, 1) != 0) {
+        client_log(current_username, "[%s] Delete access denied for user '%s': %s",
+                   current_client_ip, current_username, expanded_path);
+        unsigned char status = STATUS_ERROR;
+        send_all(client_fd, &status, 1);
+        free(expanded_path);
+        return -1;
+    }
+
+    struct stat st;
+    int result = -1;
+    if (stat(expanded_path, &st) == 0) {
+        if (S_ISDIR(st.st_mode))
+            result = rmdir(expanded_path);
+        else
+            result = unlink(expanded_path);
+    }
+
+    unsigned char status = (result == 0) ? STATUS_OK : STATUS_ERROR;
+    if (result == 0)
+        client_log(current_username, "[%s] Deleted: %s", current_username, expanded_path);
+    else
+        client_log(current_username, "[%s] Delete failed for: %s", current_username, expanded_path);
+
+    send_all(client_fd, &status, 1);
+    free(expanded_path);
+    return (result == 0) ? 0 : -1;
+}
+
+
+/**
  * @brief Main entry point for handling an authenticated client session
  *
  * Called by main.c after receiving the unlock byte (0x01).
@@ -846,6 +904,8 @@ int handle_unlocked_session(int client_fd, const char *client_ip) {
         return handle_upload(client_fd);
     } else if (mode == MODE_LIST) {
         return handle_list(client_fd);
+    } else if (mode == MODE_DELETE) {
+        return handle_delete(client_fd);
     }
 
     client_log(current_username, "[%s] Unknown mode byte: 0x%02x", current_username, mode);

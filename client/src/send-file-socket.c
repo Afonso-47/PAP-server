@@ -64,6 +64,7 @@
 #define MODE_DOWNLOAD   'D'
 #define MODE_UPLOAD     'U'
 #define MODE_LIST       'L'
+#define MODE_DELETE     'X'
 
 /* Maximum length (bytes) of any path or filename sent over the wire. */
 #define MAX_PATH_LEN    4096
@@ -92,6 +93,7 @@
 #define ERR_REMOTE_PATH 32   /* send_path() for remote file/dir failed     */
 #define ERR_TRANSFER    64   /* upload_file() / receive_file() failed      */
 #define ERR_AUTH       128   /* authentication failed                       */
+#define ERR_DELETE     256   /* delete_remote() failed                     */
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 
@@ -939,4 +941,58 @@ char *list_directory(const char *host,
 
 	CLOSE_SOCK(sock);
 	return result;   /* Caller must free() */
+}
+
+/**
+ * delete_from_server - Delete a file or directory on the remote server.
+ *
+ * Connects, performs the unlock/username/auth/mode handshake, sends the
+ * remote path, then waits for a STATUS_OK (0x00) or STATUS_ERROR (0x01)
+ * byte from the server.
+ *
+ * @param host        Server hostname or IP address.
+ * @param port        Server port as a string.
+ * @param username    Username sent for tilde expansion.
+ * @param password    Plaintext password for authentication.
+ * @param remote_path Path to the file or directory to delete on the server.
+ * @return            ERR_NONE (0) on success, or a bitmask of ERR_* constants:
+ *                      ERR_CONNECT      – could not connect
+ *                      ERR_UNLOCK       – unlock failed
+ *                      ERR_PATH         – sending username failed
+ *                      ERR_AUTH         – authentication failed
+ *                      ERR_MODE         – sending mode byte failed
+ *                      ERR_REMOTE_PATH  – sending remote path failed
+ *                      ERR_DELETE       – server reported deletion failure
+ */
+int delete_from_server(const char *host,
+                       const char *port,
+                       const char *username,
+                       const char *password,
+                       const char *remote_path)
+{
+	sock_t sock = create_socket(host, port);
+	if (sock == SOCK_INVALID)
+		return ERR_CONNECT;
+
+	int rc = ERR_NONE;
+	if (send_unlock(sock) != 0)
+		rc |= ERR_UNLOCK;
+	if (rc == ERR_NONE && send_path(sock, username) != 0)
+		rc |= ERR_PATH;
+	if (rc == ERR_NONE && authenticate_with_server(sock, password) != 0)
+		rc |= ERR_AUTH;
+	if (rc == ERR_NONE && send_mode(sock, MODE_DELETE) != 0)
+		rc |= ERR_MODE;
+	if (rc == ERR_NONE && send_path(sock, remote_path) != 0)
+		rc |= ERR_REMOTE_PATH;
+
+	if (rc == ERR_NONE) {
+		/* Wait for the server's status byte: 0x00 = OK, 0x01 = ERROR. */
+		unsigned char status = 0xFF;
+		if (recv_exact(sock, &status, 1) != 0 || status != 0x00)
+			rc |= ERR_DELETE;
+	}
+
+	CLOSE_SOCK(sock);
+	return rc;
 }
