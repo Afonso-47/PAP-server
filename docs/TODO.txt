@@ -1,0 +1,21 @@
+TODO:
+
+[x] - Start Server
+[x] - Start Client
+[x] - Show Failed Client Auth
+[x] - Show Successfull Client Auth
+[x] - Show Client Dir Navigation
+[x] - Attempt Access to Root Files
+[x] - Show Client File Download
+[x] - Show Client File Upload
+[x] - Show Client File Deletion
+[x] - Show Logout
+[x] - Login as Root
+[x] - Show Root Dir Navigation
+[x] - Attempt Access to Root Files
+[x] - Show Root File Download
+[x] - Show Root File Upload
+[x] - Show Root File Deletion
+[x] - Logout
+[x] - Stop the Server
+[x] - Show logs
