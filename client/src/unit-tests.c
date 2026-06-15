@@ -13,8 +13,8 @@
 #define USERNAME		"root"
 #define PASSWORD		"ServerXONXOmj7576«p»"
 #define LOCAL_FILE		"./test.txt"
-#define REMOTE_TARGET	"/root/temp.txt"
-#define DOWNLOAD_DIR	"./downloads"
+#define REMOTE_TARGET		"/root/temp.txt"
+#define DOWNLOAD_DIR		"./downloads"
 #define LIST_PATH		"/root"
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
